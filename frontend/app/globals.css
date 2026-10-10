@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body { height: 100%; overflow: hidden; }
+#__next { height: 100%; }
+
+/* ── Theme tokens ─────────────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+  --bg-primary: #0b0e11;
+  --bg-panel: #0f1215;
+  --bg-surface: #161a1e;
+  --bg-hover: #1c1f26;
+  --border: #1c1f26;
+  --border-focus: #f59e0b;
+  --text-primary: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-muted: #52525b;
+  --chart-grid: #1a1d23;
+  --chart-bg: #0b0e11;
+  --chart-text: #71717a;
+  --chart-crosshair: #3f3f46;
+  --candle-up: #10b981;
+  --candle-down: #f43f5e;
+  --accent: #f59e0b;
+  --success: #10b981;
+  --danger: #f43f5e;
+  --warning: #f59e0b;
+}
+
+[data-theme="light"] {
+  --bg-primary: #f8f9fa;
+  --bg-panel: #ffffff;
+  --bg-surface: #f1f3f5;
+  --bg-hover: #e9ecef;
+  --border: #dee2e6;
+  --border-focus: #e67700;
+  --text-primary: #1a1a2e;
+  --text-secondary: #495057;
+  --text-muted: #adb5bd;
+  --chart-grid: #e9ecef;
+  --chart-bg: #ffffff;
+  --chart-text: #6c757d;
+  --chart-crosshair: #868e96;
+  --candle-up: #12b886;
+  --candle-down: #e03131;
+  --accent: #e67700;
+  --success: #12b886;
+  --danger: #e03131;
+  --warning: #e67700;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: #ced4da; border-radius: 3px; }
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #adb5bd; }
+
+.tabular-nums { font-variant-numeric: tabular-nums; }
+
+.depth-bar { transition: width 150ms ease-out; }
+
+/* ── Price flash animation ────────────────────────────────── */
+@keyframes flashGreen {
+  0% { background-color: rgba(16, 185, 129, 0.3); }
+  100% { background-color: transparent; }
+}
+@keyframes flashRed {
+  0% { background-color: rgba(244, 63, 94, 0.3); }
+  100% { background-color: transparent; }
+}
+.flash-green { animation: flashGreen 600ms ease-out; }
+.flash-red { animation: flashRed 600ms ease-out; }
+
+@keyframes flashTextGreen {
+  0% { color: #10b981; }
+  100% { color: inherit; }
+}
+@keyframes flashTextRed {
+  0% { color: #f43f5e; }
+  100% { color: inherit; }
+}
+.flash-text-green { animation: flashTextGreen 500ms ease-out; }
+.flash-text-red { animation: flashTextRed 500ms ease-out; }
+
+.glow-green { box-shadow: 0 0 8px rgba(16, 185, 129, 0.3); }
+.glow-red { box-shadow: 0 0 8px rgba(244, 63, 94, 0.3); }
+
+/* ── Tooltip for toolbar ──────────────────────────────────── */
+.tooltip-trigger { position: relative; }
+.tooltip-trigger::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 3px 7px;
+  border-radius: 4px;
+  font-size: 10px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 150ms;
+  z-index: 100;
+}
+[data-theme="dark"] .tooltip-trigger::after {
+  background: #27272a; color: #d4d4d8; border: 1px solid #3f3f46;
+}
+[data-theme="light"] .tooltip-trigger::after {
+  background: #343a40; color: #f8f9fa; border: 1px solid #495057;
+}
+.tooltip-trigger:hover::after { opacity: 1; }

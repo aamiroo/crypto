@@ -1,0 +1,19 @@
+{
+  "name": "crypto-terminal",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev": "npx concurrently -n back,front -c blue,green \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "build": "cd frontend && npm run build",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./tests/register.mjs --test tests/*.test.ts",
+    "start": "npm run install:all && npm run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^7.0.2"
+  }
+}

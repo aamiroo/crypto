@@ -1,0 +1,123 @@
+"use client";
+
+import { useEffect, useRef, useCallback } from "react";
+import { MarketWSClient } from "@/lib/ws/client";
+import { useMarketStore } from "@/lib/store/marketStore";
+import { useChartStore } from "@/lib/store/chartStore";
+import { loadHistoricalKlines } from "@/lib/api/klines";
+
+const GATEWAY_WS_URL =
+  process.env.NEXT_PUBLIC_GATEWAY_WS_URL ||
+  (typeof window !== "undefined"
+    ? `ws://${window.location.hostname}:8080/ws`
+    : "ws://localhost:8080/ws");
+
+/**
+ * Single persistent WS connection + historical kline loader.
+ * 1. Connects once on mount
+ * 2. Subscribes tickers for ALL symbols
+ * 3. On symbol/timeframe change: loads historical klines via REST, then subscribes live kline
+ */
+export function useMarketFeed() {
+  const clientRef = useRef<MarketWSClient | null>(null);
+  const symbolRef = useRef<string>("");
+  const intervalRef = useRef<string>("");
+  const tickerSubs = useRef<Set<string>>(new Set());
+  const applyEnvelope = useMarketStore((s) => s.applyEnvelope);
+  const setConnected = useMarketStore((s) => s.setConnected);
+
+  // ── Subscribe live kline for a symbol+interval ────────────────────────
+  const subscribeLiveKline = useCallback((client: MarketWSClient, symbol: string, interval: string) => {
+    client.subscribe({ channel: "kline", symbol, interval });
+  }, []);
+
+  const unsubscribeLiveKline = useCallback((client: MarketWSClient, symbol: string, interval: string) => {
+    client.unsubscribe("kline", symbol, interval);
+  }, []);
+
+  const doSelectSymbol = useCallback((client: MarketWSClient, sym: string) => {
+    const oldSym = symbolRef.current;
+    symbolRef.current = sym;
+    const iv = useChartStore.getState().timeframe;
+    intervalRef.current = iv;
+
+    // Unsubscribe old detail channels
+    if (oldSym) {
+      client.unsubscribe("orderbook", oldSym);
+      client.unsubscribe("trades", oldSym);
+      unsubscribeLiveKline(client, oldSym, iv);
+    }
+
+    client.sendMessage({ type: "select_symbol", symbol: sym });
+    client.subscribe({ channel: "orderbook", symbol: sym, depth: 25 });
+    client.subscribe({ channel: "trades", symbol: sym });
+    subscribeLiveKline(client, sym, iv);
+
+    // Fetch historical klines (validated + merged into the store)
+    void loadHistoricalKlines(sym, iv);
+  }, [subscribeLiveKline, unsubscribeLiveKline]);
+
+  // ── WS connection lifecycle ───────────────────────────────────
+  useEffect(() => {
+    const client = new MarketWSClient(GATEWAY_WS_URL);
+    clientRef.current = client;
+
+    const unsubMessage = client.onMessage((env) => {
+      applyEnvelope(env);
+
+      if (env.type === "symbols" && Array.isArray(env.data)) {
+        const symbols: string[] = env.data;
+        for (const sym of symbols) {
+          if (!tickerSubs.current.has(sym)) {
+            client.subscribe({ channel: "ticker", symbol: sym });
+            tickerSubs.current.add(sym);
+          }
+        }
+        if (!symbolRef.current && symbols.length > 0) {
+          symbolRef.current = symbols[0]!;
+          doSelectSymbol(client, symbols[0]!);
+        }
+      }
+    });
+    const unsubState = client.onStateChange(setConnected);
+
+    client.connect();
+
+    const activeTickerSubs = tickerSubs.current;
+    return () => {
+      unsubMessage();
+      unsubState();
+      client.disconnect();
+      setConnected(false);
+      activeTickerSubs.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Track symbol changes ──────────────────────────────────────
+  const symbol = useMarketStore((s) => s.symbol);
+  useEffect(() => {
+    const client = clientRef.current;
+    if (!client || !symbol || symbol === symbolRef.current) return;
+    doSelectSymbol(client, symbol);
+  }, [symbol, doSelectSymbol]);
+
+  // ── Track timeframe changes ───────────────────────────────────
+  const timeframe = useChartStore((s) => s.timeframe);
+  useEffect(() => {
+    const client = clientRef.current;
+    if (!client || !symbol) return;
+    if (timeframe === intervalRef.current) return;
+
+    const oldIv = intervalRef.current;
+    intervalRef.current = timeframe;
+
+    // Unsubscribe old kline, subscribe new
+    if (oldIv) unsubscribeLiveKline(client, symbol, oldIv);
+    subscribeLiveKline(client, symbol, timeframe);
+
+    // Fetch historical data for new interval
+    void loadHistoricalKlines(symbol, timeframe);
+  }, [timeframe, symbol, subscribeLiveKline, unsubscribeLiveKline]);
+}
+
