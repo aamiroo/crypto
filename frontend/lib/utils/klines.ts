@@ -26,6 +26,8 @@ export function klineKey(symbol: string, interval: string): string {
   return `${symbol}:${interval}`;
 }
 
+/** Strict numeric read of a venue field: "", NaN and Infinity become null, so
+ *  one corrupt value rejects the candle instead of poisoning the chart. */
 function toFinite(v: unknown): number | null {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
   if (typeof v === "string") {
@@ -94,10 +96,14 @@ export function normalizeKlines(raw: unknown, fallbackInterval?: string): KlineD
   return capKlines(out);
 }
 
+/** Keeps the newest MAX_KLINES: older history is scroll-back, the live tail is
+ *  what the chart and the indicators are computed from. */
 function capKlines(list: KlineData[]): KlineData[] {
   return list.length > MAX_KLINES ? list.slice(list.length - MAX_KLINES) : list;
 }
 
+/** Value equality for a candle already known to share its timestamp — this is
+ *  what separates "the stream repeated itself" from a real update. */
 function sameValues(a: KlineData, b: KlineData): boolean {
   return (
     a.open === b.open && a.high === b.high && a.low === b.low &&
@@ -159,6 +165,9 @@ export interface CandleBar { time: Time; open: number; high: number; low: number
 export interface LineBar { time: Time; value: number; }
 export interface VolumeBar { time: Time; value: number; color: string; }
 
+/** The store keeps ms (venue-native); lightweight-charts is fed UTCTimestamp
+ *  seconds, so every series mapping and every coordinate lookup goes through
+ *  this one conversion. */
 function toBarTime(k: KlineData): Time {
   return Math.floor(k.openTime / 1000) as Time;
 }

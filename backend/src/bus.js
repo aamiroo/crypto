@@ -5,9 +5,15 @@
 import { EventEmitter } from "node:events";
 
 class Bus extends EventEmitter {
+  /** Subjects match exactly — there are no NATS `*`/`>` wildcards here — so the
+   *  shared shape is a naming convention and every listener still binds the full
+   *  subject string it wants. */
   constructor() {
     super();
-    this.setMaxListeners(2000);
+    // The gateway registers one listener per (venue, symbol, channel); with
+    // hundreds of instruments that is several thousand subjects, so the
+    // default 11-listener warning is noise rather than a leak signal.
+    this.setMaxListeners(0);
   }
 
   /** Publish a JSON-serialisable payload on a subject. */

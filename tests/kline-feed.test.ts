@@ -44,6 +44,16 @@ function live(symbol: string, k: { interval: string; openTime: number } & Record
   useMarketStore.getState().applyEnvelope(env);
 }
 
+/** Seed a window the way a finished `loadHistoricalKlines` leaves it: merged
+ *  candles plus `ready` status, which is what unlocks backfill. */
+function seedWindow(symbol: string, firstOpenTimeIndex: number, count: number, interval = "1m") {
+  useMarketStore.getState().mergeKlinesInto(symbol, interval, normalizeKlines(
+    Array.from({ length: count }, (_, i) => raw(BASE + (firstOpenTimeIndex + i) * MIN)),
+    interval,
+  ));
+  useMarketStore.getState().setKlineStatus(symbol, interval, "ready");
+}
+
 // ── live store merge: the crash scenarios ─────────────────────────────────
 
 test("store: live klines then REST window then out-of-order replay stays sorted", () => {
@@ -183,10 +193,7 @@ test("loadHistoricalKlines: concurrent calls collapse into one fetch", async () 
 
 test("loadOlderKlines: fetches a window ending at the oldest candle and merges", async () => {
   const sym = "O1";
-  useMarketStore.getState().mergeKlinesInto(sym, "1m", normalizeKlines(
-    Array.from({ length: 100 }, (_, i) => raw(BASE + (1000 + i) * MIN)),
-    "1m",
-  ));
+  seedWindow(sym, 1000, 100);
   const oldestBefore = getKlines(sym)[0]!.openTime;
 
   fetchResponder = () => okBatch(Array.from({ length: 50 }, (_, i) => raw(BASE + (950 + i) * MIN)));
@@ -204,10 +211,7 @@ test("loadOlderKlines: fetches a window ending at the oldest candle and merges",
 
 test("loadOlderKlines: is rate-limited by cooldown", async () => {
   const sym = "O2";
-  useMarketStore.getState().mergeKlinesInto(sym, "1m", normalizeKlines(
-    Array.from({ length: 100 }, (_, i) => raw(BASE + (2000 + i) * MIN)),
-    "1m",
-  ));
+  seedWindow(sym, 2000, 100);
   // Always serve 50 candles strictly older than whatever the window's oldest is.
   fetchResponder = () => {
     const oldest = getKlines(sym)[0]!.openTime;
@@ -233,10 +237,7 @@ test("loadOlderKlines: is rate-limited by cooldown", async () => {
 
 test("loadOlderKlines: partial page marks history exhausted", async () => {
   const sym = "O3";
-  useMarketStore.getState().mergeKlinesInto(sym, "1m", normalizeKlines(
-    Array.from({ length: 100 }, (_, i) => raw(BASE + (3000 + i) * MIN)),
-    "1m",
-  ));
+  seedWindow(sym, 3000, 100);
   fetchResponder = () => okBatch(Array.from({ length: 5 }, (_, i) => raw(BASE + (2995 + i) * MIN)));
 
   assert.equal(await loadOlderKlines(sym, "1m"), true);
@@ -254,12 +255,21 @@ test("loadOlderKlines: partial page marks history exhausted", async () => {
 
 test("loadOlderKlines: refuses to fetch when the window is already at MAX_KLINES", async () => {
   const sym = "O4";
-  useMarketStore.getState().mergeKlinesInto(sym, "1m", normalizeKlines(
-    Array.from({ length: MAX_KLINES }, (_, i) => raw(BASE + i * MIN)),
-    "1m",
-  ));
+  seedWindow(sym, 0, MAX_KLINES);
   assert.equal(await loadOlderKlines(sym, "1m"), false);
   assert.equal(fetchCalls.length, 0);
+});
+
+test("loadOlderKlines: waits for the recent window instead of backfilling live bars", async () => {
+  const sym = "O6";
+  live(sym, raw(BASE + 400 * MIN));
+  live(sym, raw(BASE + 401 * MIN));
+  assert.equal(await loadOlderKlines(sym, "1m"), false, "no backfill before the first REST window");
+  assert.equal(fetchCalls.length, 0);
+
+  useMarketStore.getState().setKlineStatus(sym, "1m", "ready");
+  fetchResponder = () => okBatch(Array.from({ length: 50 }, (_, i) => raw(BASE + (350 + i) * MIN)));
+  assert.equal(await loadOlderKlines(sym, "1m", 50), true, "backfill unlocks once the window is ready");
 });
 
 test("loadOlderKlines: no existing data -> no fetch", async () => {

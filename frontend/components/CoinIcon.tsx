@@ -22,6 +22,8 @@ const FALLBACK_COLORS = [
   "#06b6d4", "#84cc16", "#6366f1", "#ef4444", "#22d3ee",
 ];
 
+/** Deterministic pick from FALLBACK_COLORS for coins with no known logo, so a
+ *  symbol keeps the same tile across renders instead of reshuffling. */
 function hashStr(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;

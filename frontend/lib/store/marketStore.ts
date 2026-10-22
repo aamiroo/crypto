@@ -1,9 +1,10 @@
 import { create } from "zustand";
 import type {
-  Envelope, KlineData, OrderBookDeltaData, OrderBookSnapshotData,
-  TickerData, TradeData,
+  Envelope, KlineData, OrderBookDeltaData, OrderBookSnapshotData, PriceLevel,
+  SymbolsData, TickerData, TradeData,
 } from "@/lib/types";
 import { EMPTY_KLINES, MAX_KLINES, klineKey, mergeKlines, mergeRawKline } from "@/lib/utils/klines";
+import { setInstruments } from "@/lib/utils/symbol";
 
 /** Orderbook stored as maps for O(1) delta apply */
 interface OrderBookState { bids: Map<string, string>; asks: Map<string, string>; }
@@ -20,6 +21,8 @@ interface MarketState {
   klineStatus: Record<string, KlineStatus>;             // `${symbol}:${interval}` -> status
   tickers: Record<string, TickerData>;
   connected: boolean;
+  /** Wall-clock ms of the last inbound message (any channel) — drives stale UI. */
+  lastMessageTs: number;
 
   setSymbol: (s: string) => void;
   setConnected: (c: boolean) => void;
@@ -29,9 +32,19 @@ interface MarketState {
 }
 
 const MAX_TRADES = 100;
+const TICKER_BATCH_MS = 250;
+const MESSAGE_TS_STEP_MS = 1000;
+
+/** Only a plausible exchange pair is trusted from the cache: a garbage symbol
+ *  makes every subscribe and REST call fail, which looks like a dead terminal. */
+function readStoredSymbol(): string {
+  if (typeof window === "undefined") return "BTCUSDT";
+  const v = localStorage.getItem("ct_sym");
+  return v && /^[A-Z0-9]{3,20}$/.test(v) ? v : "BTCUSDT";
+}
 
 export const useMarketStore = create<MarketState>((set, get) => ({
-  symbol: typeof window !== "undefined" ? (localStorage.getItem("ct_sym") || "BTCUSDT") : "BTCUSDT",
+  symbol: readStoredSymbol(),
   symbols: [],
   orderBooks: {},
   recentTrades: {},
@@ -39,6 +52,7 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   klineStatus: {},
   tickers: {},
   connected: false,
+  lastMessageTs: 0,
 
   setSymbol: (symbol) => { if (typeof window !== "undefined") localStorage.setItem("ct_sym", symbol); set({ symbol }); },
   setConnected: (connected) => set({ connected }),
@@ -57,9 +71,17 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     }),
 
   applyEnvelope: (env) => {
+    // Any inbound frame (incl. pong) proves the socket is alive. Coarsened: a
+    // per-frame timestamp would notify every subscriber several times a second.
+    if (Date.now() - get().lastMessageTs >= MESSAGE_TS_STEP_MS) set({ lastMessageTs: Date.now() });
+
     if (env.type === "symbols") {
-      const d = env as unknown as { data: string[] };
-      if (Array.isArray(d.data)) set({ symbols: d.data });
+      const data = env.data as SymbolsData | undefined;
+      const instruments = data?.instruments;
+      if (Array.isArray(instruments)) {
+        setInstruments(instruments);
+        set({ symbols: instruments.map((i) => i.symbol) });
+      }
       return;
     }
 
@@ -110,14 +132,52 @@ export const useMarketStore = create<MarketState>((set, get) => ({
         break;
       }
       case "ticker": {
-        const data = env.data as TickerData;
-        set((st) => ({ tickers: { ...st.tickers, [sym]: data } }));
+        // One commit per batch: hundreds of symbols tick continuously, and each
+        // commit copies the whole ticker map and notifies every subscriber.
+        queueTicker(sym, env.data as TickerData);
         break;
       }
     }
   },
 }));
 
+let tickerBatch = new Map<string, TickerData>();
+let tickerFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Merges every queued ticker into ONE store update. Hundreds of symbols tick
+ *  several times per second, and a `set` per message would re-render the whole
+ *  watchlist that often instead of once per batch window. */
+function flushTickerBatch() {
+  tickerFlushTimer = null;
+  if (tickerBatch.size === 0) return;
+  const batch = Object.fromEntries(tickerBatch);
+  tickerBatch = new Map();
+  useMarketStore.setState((st) => ({ tickers: { ...st.tickers, ...batch } }));
+}
+
+/** Buffer a ticker until the next flush. Only the newest value per symbol
+ *  matters, so intermediate frames are dropped on purpose. */
+function queueTicker(sym: string, data: TickerData) {
+  if (!data) return;
+  // The venue's streaming ticker carries no best bid/ask (only the REST
+  // snapshot does), so keep the last known level instead of blanking it out.
+  const prev = tickerBatch.get(sym) ?? useMarketStore.getState().tickers[sym];
+  const next = prev && data.bidPrice === undefined && prev.bidPrice !== undefined
+    ? { ...data, bidPrice: prev.bidPrice, askPrice: prev.askPrice }
+    : data;
+  tickerBatch.set(sym, next);
+  if (tickerFlushTimer) return;
+  tickerFlushTimer = setTimeout(flushTickerBatch, TICKER_BATCH_MS);
+}
+
+/** Test hook: apply pending ticker updates synchronously. */
+export function flushTickerBatchNow() {
+  if (tickerFlushTimer) clearTimeout(tickerFlushTimer);
+  flushTickerBatch();
+}
+
+/** Merge side levels into the book map. Size 0 deletes the price — that is how
+ *  a delta says a level is gone; storing it would show a phantom in the depth. */
 function applyLevels(target: Map<string, string>, levels: [string, string][]) {
   for (const [price, size] of levels) {
     if (parseFloat(size) === 0) target.delete(price);
@@ -134,16 +194,72 @@ export function selectKlines(state: MarketState, symbol: string, interval: strin
   return state.klines[symbol]?.[interval] ?? EMPTY_KLINES;
 }
 
-/** Sorted top-N bids/asks */
-export function selectDepth(state: MarketState, symbol: string, depth = 25) {
+/**
+ * Sorted top-N bids/asks.
+ * The result is memoized per book object, so a component can select it without
+ * producing a fresh array (and an infinite re-render loop) on every store
+ * notification.
+ */
+const EMPTY_DEPTH: DepthView = { bids: [], asks: [], totalBidQty: 0, totalAskQty: 0 };
+export interface DepthView {
+  bids: PriceLevel[];
+  asks: PriceLevel[];
+  totalBidQty: number;
+  totalAskQty: number;
+}
+const depthCache = new WeakMap<OrderBookState, Map<number, DepthView>>();
+
+/** Two-level cache keyed on book identity then depth. Every delta installs a
+ *  new book object, so the WeakMap entry drops itself — no manual invalidation,
+ *  and different depths never recompute the same sort. */
+export function selectDepth(state: MarketState, symbol: string, depth = 25): DepthView {
   const book = state.orderBooks[symbol];
-  if (!book) return { bids: [] as [string, string][], asks: [] as [string, string][] };
-  const bids = [...book.bids.entries()]
-    .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))
-    .slice(0, depth);
-  const asks = [...book.asks.entries()]
-    .sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]))
-    .slice(0, depth);
-  return { bids, asks };
+  if (!book) return EMPTY_DEPTH;
+  let perDepth = depthCache.get(book);
+  if (!perDepth) {
+    perDepth = new Map();
+    depthCache.set(book, perDepth);
+  }
+  const hit = perDepth.get(depth);
+  if (hit) return hit;
+  const bids = sortLevels(book.bids, -1).slice(0, depth);
+  const asks = sortLevels(book.asks, 1).slice(0, depth);
+  const view: DepthView = {
+    bids,
+    asks,
+    totalBidQty: sumQty(book.bids),
+    totalAskQty: sumQty(book.asks),
+  };
+  perDepth.set(depth, view);
+  return view;
+}
+
+/** Prices stay strings (venue precision is lossy as a float); `dir` is -1 for
+ *  bids (best = highest first) and +1 for asks (best = lowest first). */
+function sortLevels(levels: Map<string, string>, dir: 1 | -1): PriceLevel[] {
+  const out: PriceLevel[] = [];
+  for (const [price, size] of levels) out.push([price, size]);
+  out.sort((a, b) => (parseFloat(a[0]) - parseFloat(b[0])) * dir);
+  return out;
+}
+
+/** Sums every level, not just the cached top-`depth` slice, so DepthView's
+ *  totalBid/AskQty reflect whole-book pressure. `|| 0` skips a bad size. */
+function sumQty(levels: Map<string, string>): number {
+  let total = 0;
+  for (const size of levels.values()) total += parseFloat(size) || 0;
+  return total;
+}
+
+/** Best (highest) bid price from the live book, or null when empty. */
+export function selectBestBid(state: MarketState, symbol: string): number | null {
+  const top = selectDepth(state, symbol, 1).bids[0];
+  return top ? parseFloat(top[0]) : null;
+}
+
+/** Best (lowest) ask price from the live book, or null when empty. */
+export function selectBestAsk(state: MarketState, symbol: string): number | null {
+  const top = selectDepth(state, symbol, 1).asks[0];
+  return top ? parseFloat(top[0]) : null;
 }
 

@@ -26,20 +26,20 @@ export function fmtVolume(vol: string | number): string {
   return n.toFixed(2);
 }
 
-/** Format percent change */
+/** Format a percentage change. `pct` is already a percent: the gateway converts
+ *  the venue's fraction, so guessing from magnitude here would mis-render a
+ *  genuine ±0.5% move as ±50%. */
 export function fmtPct(pct: string | number): string {
   const n = typeof pct === "string" ? parseFloat(pct) : pct;
-  if (isNaN(n)) return "0.00%";
-  // Bybit sends as decimal fraction (e.g., 0.05 = 5%)
-  const pctVal = Math.abs(n) < 1 ? n * 100 : n;
-  return (pctVal >= 0 ? "+" : "") + pctVal.toFixed(2) + "%";
+  if (!Number.isFinite(n)) return "0.00%";
+  return (n >= 0 ? "+" : "") + n.toFixed(2) + "%";
 }
 
-/** Format change value with + prefix */
-export function fmtChange(change: string | number): string {
+/** Sign-prefixed change in the same unit as the input price. */
+export function fmtChange(change: string | number, decimals = 2): string {
   const n = typeof change === "string" ? parseFloat(change) : change;
-  if (isNaN(n)) return "0.00";
-  return (n >= 0 ? "+" : "") + n.toFixed(2);
+  if (!Number.isFinite(n)) return "0";
+  return (n >= 0 ? "+" : "") + n.toFixed(decimals);
 }
 
 /** Get base asset from symbol */

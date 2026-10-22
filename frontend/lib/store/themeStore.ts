@@ -7,6 +7,8 @@ interface ThemeState {
   setTheme: (t: ThemeName) => void;
 }
 
+/** Resolve the initial theme: trust a stored value only when it is one of the
+ *  known names, otherwise honour the OS `prefers-color-scheme`; SSR -> dark. */
 function getInitial(): ThemeName {
   if (typeof window === "undefined") return "dark";
   const stored = localStorage.getItem("theme") as ThemeName | null;
@@ -14,6 +16,9 @@ function getInitial(): ThemeName {
   return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
 }
 
+/** One switch updates every representation at once: the `[data-theme]` attr that
+ *  drives the CSS palette, the dark/light class mirroring the SSR <html>, and
+ *  localStorage so a reload starts on the chosen theme. */
 function applyTheme(t: ThemeName) {
   if (typeof document === "undefined") return;
   document.documentElement.setAttribute("data-theme", t);

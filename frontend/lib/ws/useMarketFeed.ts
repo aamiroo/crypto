@@ -4,7 +4,9 @@ import { useEffect, useRef, useCallback } from "react";
 import { MarketWSClient } from "@/lib/ws/client";
 import { useMarketStore } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
+import { toast } from "@/lib/store/toastStore";
 import { loadHistoricalKlines } from "@/lib/api/klines";
+import type { SymbolsData } from "@/lib/types";
 
 const GATEWAY_WS_URL =
   process.env.NEXT_PUBLIC_GATEWAY_WS_URL ||
@@ -48,7 +50,7 @@ export function useMarketFeed() {
       unsubscribeLiveKline(client, oldSym, iv);
     }
 
-    client.sendMessage({ type: "select_symbol", symbol: sym });
+    client.selectSymbol(sym);
     client.subscribe({ channel: "orderbook", symbol: sym, depth: 25 });
     client.subscribe({ channel: "trades", symbol: sym });
     subscribeLiveKline(client, sym, iv);
@@ -65,18 +67,22 @@ export function useMarketFeed() {
     const unsubMessage = client.onMessage((env) => {
       applyEnvelope(env);
 
-      if (env.type === "symbols" && Array.isArray(env.data)) {
-        const symbols: string[] = env.data;
-        for (const sym of symbols) {
-          if (!tickerSubs.current.has(sym)) {
-            client.subscribe({ channel: "ticker", symbol: sym });
-            tickerSubs.current.add(sym);
-          }
+      if (env.type === "symbols") {
+        const data = env.data as SymbolsData | undefined;
+        const instruments = data?.instruments;
+        if (!Array.isArray(instruments)) return;
+        // One grouped subscribe frame: a per-symbol frame for every listed pair
+        // meant hundreds of writes per connect.
+        client.subscribeBatch(instruments.map((i) => ({ channel: "ticker" as const, symbol: i.symbol })));
+        for (const i of instruments) tickerSubs.current.add(i.symbol);
+        const current = useMarketStore.getState().symbol;
+        const known = instruments.some((i) => i.symbol === current);
+        if (!known && !symbolRef.current && instruments.length > 0) {
+          useMarketStore.getState().setSymbol(instruments[0]!.symbol);
         }
-        if (!symbolRef.current && symbols.length > 0) {
-          symbolRef.current = symbols[0]!;
-          doSelectSymbol(client, symbols[0]!);
-        }
+      } else if (env.type === "error") {
+        const e = env.data as { code?: string; message?: string } | undefined;
+        if (e?.code) toast("warning", e.message || e.code);
       }
     });
     const unsubState = client.onStateChange(setConnected);

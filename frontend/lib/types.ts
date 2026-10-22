@@ -35,10 +35,9 @@ export interface KlineData {
 
 export interface TickerData {
   lastPrice: string;
-  indexPrice: string;
-  markPrice: string;
   bidPrice?: string;
   askPrice?: string;
+  /** Percent, not fraction: the gateway converts the venue's 24h ratio. */
   change24h: string;
   high24h: string;
   low24h: string;
@@ -62,6 +61,24 @@ export interface ClientMessage {
   symbol?: string;
 }
 
+/** One tradable instrument as advertised by the venue (docs/PROTOCOL.md §2). */
+export interface InstrumentInfo {
+  symbol: string;
+  baseCoin: string;
+  priceDecimals: number;
+  qtyDecimals: number;
+}
+
+export interface SymbolsData {
+  venue: string;
+  instruments: InstrumentInfo[];
+}
+
+/** Codes the gateway returns in an `error` envelope. */
+export type ErrorCode =
+  | "BAD_JSON" | "BAD_REQUEST" | "BAD_CHANNEL" | "BAD_INTERVAL"
+  | "UNKNOWN_SYMBOL";
+
 // ── App types ─────────────────────────────────────────────────────────
 export type Timeframe = "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d" | "1w";
 export type ChartType = "candlestick" | "line" | "area";
@@ -75,41 +92,24 @@ export interface IndicatorConfig {
 }
 
 export type DrawingType =
-  | "trendline" | "horizontal" | "vertical" | "ray"
-  | "rectangle" | "fibonacci" | "fibextension" | "text"
-  | "pricelabel" | "measure";
+  | "horizontal" | "vertical" | "trendline" | "ray"
+  | "fibonacci" | "measure" | "longPosition" | "shortPosition";
+
+export interface DrawingPoint {
+  /** Bar open time in ms. */
+  time: number;
+  price: number;
+}
 
 export interface Drawing {
   id: string;
   type: DrawingType;
-  points: { time: number; price: number }[];
+  /** Drawings belong to the symbol they were drawn on. */
+  symbol: string;
+  points: DrawingPoint[];
   color: string;
-  label?: string;
-  fibLevels?: number[];
   locked?: boolean;
   visible?: boolean;
-}
-
-export interface PaperOrder {
-  id: string;
-  symbol: string;
-  side: "buy" | "sell";
-  type: "limit" | "market";
-  price: string;
-  qty: string;
-  status: "open" | "filled" | "cancelled";
-  filledAt?: number;
-  filledPrice?: string;
-  createdAt: number;
-}
-
-export interface Position {
-  symbol: string;
-  side: "long" | "short";
-  qty: string;
-  avgEntry: string;
-  unrealizedPnl: string;
-  margin: string;
 }
 
 export interface SymbolPrecision {
@@ -119,6 +119,35 @@ export interface SymbolPrecision {
 
 export type ThemeName = "dark" | "light";
 
+/** A client-side price alert. Triggered by evaluating live ticker updates. */
+export type AlertCondition = "above" | "below";
+
+export interface PriceAlert {
+  id: string;
+  symbol: string;
+  condition: AlertCondition;
+  price: number;
+  createdAt: number;
+  triggeredAt?: number;
+  triggeredPrice?: number;
+}
+
+/** Persisted layout preferences (panel widths / collapsed state). */
+export interface LayoutState {
+  watchlistOpen: boolean;
+  watchlistWidth: number;
+  rightPanelOpen: boolean;
+}
+
+export type ToastKind = "success" | "error" | "info" | "warning";
+
+export interface Toast {
+  id: string;
+  kind: ToastKind;
+  message: string;
+  createdAt: number;
+}
+
 export interface ChartSettings {
   chartType: ChartType;
   showGrid: boolean;
@@ -126,25 +155,9 @@ export interface ChartSettings {
   showDrawings: boolean;
   showIndicators: boolean;
   autoScale: boolean;
-  magnetMode: boolean;
-  lockDrawings: boolean;
 }
 
 export type ChartTool =
-  | "crosshair" | "trendline" | "horizontal" | "vertical"
-  | "ray" | "extended" | "channel" | "rectangle"
-  | "fibonacci" | "fibextension" | "text"
-  | "pricelabel" | "measure"
-  | "eraser" | "magnet" | "lock" | "hide";
-
-export interface DataStatus {
-  connected: boolean;
-  lastTickerTs: number | null;
-  lastTradeTs: number | null;
-  lastOrderbookTs: number | null;
-  lastKlineTs: number | null;
-  currentExchange: string;
-  currentSymbol: string;
-  currentTimeframe: string;
-}
+  | "crosshair" | "horizontal" | "vertical" | "trendline" | "ray"
+  | "fibonacci" | "measure" | "longPosition" | "shortPosition";
 

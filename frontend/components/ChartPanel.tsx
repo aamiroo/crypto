@@ -4,15 +4,21 @@ import { createChart, ColorType, CrosshairMode, type IChartApi, type ISeriesApi,
 import { useMarketStore, selectKlines, type KlineStatus } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
 import { sma, ema, rsi, macd, bollinger, klineCloses } from "@/lib/utils/indicators";
-import { fmtPrice, fmtVolume } from "@/lib/utils/format";
+import { fmtPrice, fmtVolume, fmtTime } from "@/lib/utils/format";
+import { getPriceDecimals } from "@/lib/utils/symbol";
 import { useThemeStore } from "@/lib/store/themeStore";
+import type { ThemeName } from "@/lib/types";
 import {
-  EMPTY_KLINES, buildTimeIndex, diffKlines, hasOscillator, klineKey,
+  EMPTY_KLINES, buildTimeIndex, diffKlines, klineKey,
   toCandleBars, toLineBars, toVolumeBars,
 } from "@/lib/utils/klines";
 import { loadHistoricalKlines, loadOlderKlines } from "@/lib/api/klines";
-import type { ChartType, KlineData } from "@/lib/types";
+import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
+import { DrawingLayer } from "@/components/DrawingLayer";
+import type { ChartType, IndicatorConfig, KlineData } from "@/lib/types";
 
+/** Literal colors, not CSS variables: lightweight-charts paints on a canvas and
+ *  cannot resolve `var(...)`, so the theme has to be flattened before it is set. */
 function getTc(t: string) {
   return t === "light"
     ? { bg: "#fff", tx: "#6c757d", gr: "#e9ecef", bd: "#dee2e6", cr: "#868e96", up: "#12b886", dn: "#e03131", uv: "rgba(18,184,134,0.3)", dv: "rgba(224,49,49,0.3)" }
@@ -21,9 +27,21 @@ function getTc(t: string) {
 
 /** Start fetching older history once the left edge gets within this many bars. */
 const LOAD_MORE_THRESHOLD = 5;
+/** Indicator series are recomputed at most this often while candles tick. */
+const INDICATOR_REFRESH_MS = 1000;
+/** Vertical band each oscillator gets, as a fraction of chart height. */
+const OSC_BAND = 0.16;
+const VOLUME_BAND = 0.18;
+const PRICE_PAD = 0.04;
 
 type AltKind = "line" | "area";
 type AltSeries = ISeriesApi<"Line" | "Area">;
+
+/** Oscillators cross zero or run 0-100, so they must not share the price scale:
+ *  they get a band at the bottom instead (see OSC_BAND). */
+function isOscillator(t: IndicatorConfig["type"]) {
+  return t === "rsi" || t === "macd";
+}
 
 export function ChartPanel({ symbol }: { symbol: string }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -32,13 +50,22 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   const vsRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const altRef = useRef<Partial<Record<AltKind, AltSeries>>>({});
   const indRef = useRef<Map<string, ISeriesApi<SeriesType>[]>>(new Map());
+  /** Oscillator scale ids that currently have a series on the chart. */
+  const liveOscRef = useRef<string[]>([]);
+  /** The series driving the right price scale for the active chart type. */
+  const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
   /** Klines last pushed to the rendered series — drives incremental updates. */
   const lastRef = useRef<KlineData[]>(EMPTY_KLINES);
+  const klinesRef = useRef<KlineData[]>(EMPTY_KLINES);
+  const indDirty = useRef(false);
+  const themeApplied = useRef<ThemeName | null>(null);
   const timeIdxRef = useRef<Map<Time, KlineData>>(new Map());
+  const idxRef = useRef<Map<Time, number>>(new Map());
   const loadOlderRef = useRef<(() => void) | null>(null);
   const ctRef = useRef<ChartType | null>(null);
   const visRef = useRef<string>("");
   const [chartEpoch, setChartEpoch] = useState(0);
+  const [indRefresh, setIndRefresh] = useState(0);
 
   const tf = useChartStore((s) => s.timeframe);
   const ct = useChartStore((s) => s.chartType);
@@ -49,9 +76,12 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   const theme = useThemeStore((s) => s.theme);
   const status = useMarketStore((s) => s.klineStatus[klineKey(symbol, tf)]);
   const connected = useMarketStore((s) => s.connected);
-  const osc = useMemo(() => hasOscillator(inds, st.showIndicators), [inds, st.showIndicators]);
+  const oscIds = useMemo(
+    () => (st.showIndicators ? inds.filter((i) => i.visible && isOscillator(i.type)).map((i) => i.id) : []),
+    [inds, st.showIndicators],
+  );
 
-  // ── Chart lifecycle (created once per theme) ─────────────────────────
+  // ── Chart lifecycle (created once; theme is applied as options) ──────
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -73,15 +103,23 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     vsRef.current = vs;
     altRef.current = {};
     indRef.current = new Map();
+    liveOscRef.current = [];
+    themeApplied.current = theme;
     // The previous chart instance is gone — force a full re-push of data.
     lastRef.current = EMPTY_KLINES;
     timeIdxRef.current = new Map();
+    idxRef.current = new Map();
 
     ch.subscribeCrosshairMove((p) => {
       if (!p.time) { setCD(null); return; }
       const k = timeIdxRef.current.get(p.time);
       if (!k) { setCD(null); return; }
-      setCD({ time: k.openTime, open: +k.open, high: +k.high, low: +k.low, close: +k.close, volume: +k.volume });
+      const i = idxRef.current.get(p.time);
+      const prev = i !== undefined && i > 0 ? lastRef.current[i - 1] : undefined;
+      const close = +k.close;
+      const base = prev ? +prev.close : +k.open;
+      const changePct = base > 0 ? ((close - base) / base) * 100 : null;
+      setCD({ time: k.openTime, open: +k.open, high: +k.high, low: +k.low, close, volume: +k.volume, changePct });
     });
     ch.timeScale().subscribeVisibleLogicalRangeChange((range) => {
       if (!range || range.from > LOAD_MORE_THRESHOLD) return;
@@ -95,9 +133,42 @@ export function ChartPanel({ symbol }: { symbol: string }) {
         chRef.current = null;
         csRef.current = null;
         vsRef.current = null;
+        mainRef.current = null;
       }
     };
-  }, [theme, setCD]);
+    // `theme` is read for the initial palette only; switching is its own effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setCD]);
+
+  // ── Theme: recolour in place so zoom/scroll never resets ─────────────
+  useEffect(() => {
+    const ch = chRef.current;
+    if (!ch || themeApplied.current === theme) return;
+    themeApplied.current = theme;
+    const c = getTc(theme);
+    ch.applyOptions({
+      layout: { background: { type: ColorType.Solid, color: c.bg }, textColor: c.tx },
+      grid: { vertLines: { color: c.gr }, horzLines: { color: c.gr } },
+      crosshair: { vertLine: { color: c.cr, labelBackgroundColor: c.bd }, horzLine: { color: c.cr, labelBackgroundColor: c.bd } },
+      rightPriceScale: { borderColor: c.bd },
+      timeScale: { borderColor: c.bd },
+    });
+    csRef.current?.applyOptions({ upColor: c.up, downColor: c.dn, wickUpColor: c.up, wickDownColor: c.dn });
+    altRef.current.line?.applyOptions({ color: c.up });
+    altRef.current.area?.applyOptions({ lineColor: c.up, topColor: "rgba(16,185,129,0.3)" });
+    // Volume bar colours are baked into the data, so re-push them.
+    lastRef.current = EMPTY_KLINES;
+    setChartEpoch((e) => e + 1);
+  }, [theme]);
+
+  // ── Price format from the venue's tick size ──────────────────────────
+  useEffect(() => {
+    const precision = Math.min(8, Math.max(0, getPriceDecimals(symbol)));
+    const priceFormat = { type: "price" as const, precision, minMove: 10 ** -precision };
+    csRef.current?.applyOptions({ priceFormat });
+    altRef.current.line?.applyOptions({ priceFormat });
+    altRef.current.area?.applyOptions({ priceFormat });
+  }, [symbol, chartEpoch]);
 
   // ── Data → series (incremental when possible) ────────────────────────
   useEffect(() => {
@@ -141,6 +212,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     const active: ISeriesApi<SeriesType> = ct === "candlestick"
       ? cs
       : (ensureAlt(ct === "line" ? "line" : "area") as unknown as ISeriesApi<SeriesType>);
+    mainRef.current = active;
 
     const timeScale = ch.timeScale();
     const logicalRange = plan.kind === "full" ? timeScale.getVisibleLogicalRange() : null;
@@ -174,9 +246,12 @@ export function ChartPanel({ symbol }: { symbol: string }) {
         vs.update({ time: t, value: +k.volume, color: +k.close >= +k.open ? colors.uv : colors.dv });
       }
       const idx = timeIdxRef.current;
+      const order = idxRef.current;
       for (let i = plan.from; i < klines.length; i++) {
         const k = klines[i]!;
-        idx.set(Math.floor(k.openTime / 1000) as Time, k);
+        const t = Math.floor(k.openTime / 1000) as Time;
+        idx.set(t, k);
+        order.set(t, i);
       }
       lastRef.current = klines;
       return;
@@ -206,17 +281,42 @@ export function ChartPanel({ symbol }: { symbol: string }) {
 
     lastRef.current = bars;
     timeIdxRef.current = buildTimeIndex(bars);
+    const order = new Map<Time, number>();
+    for (let i = 0; i < bars.length; i++) order.set(Math.floor(bars[i]!.openTime / 1000) as Time, i);
+    idxRef.current = order;
   }, [klines, ct, theme, chartEpoch]);
 
-  // ── Indicators: stable series registry (create once, refresh data) ──
+  // ── Indicators: stable series registry, refreshed at most 1×/s ───────
+  useEffect(() => {
+    klinesRef.current = klines;
+    indDirty.current = true;
+  }, [klines]);
+
+  // Candles tick several times a second; recomputing every indicator on each
+  // frame made the chart the hottest thing on the page.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!indDirty.current) return;
+      indDirty.current = false;
+      setIndRefresh((v) => v + 1);
+    }, INDICATOR_REFRESH_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  // Config changes must be visible immediately, not on the next tick.
+  useEffect(() => {
+    setIndRefresh((v) => v + 1);
+  }, [inds, st.showIndicators, symbol, tf, chartEpoch]);
+
   useEffect(() => {
     const ch = chRef.current;
     if (!ch) return;
+    const bars = klinesRef.current;
 
     const wanted = new Map<string, ISeriesApi<SeriesType>[]>();
-    if (st.showIndicators && klines.length > 0) {
-      const closes = klineCloses(klines);
-      const times = klines.map((k) => Math.floor(k.openTime / 1000) as Time);
+    if (st.showIndicators && bars.length > 0) {
+      const closes = klineCloses(bars);
+      const times = bars.map((k) => Math.floor(k.openTime / 1000) as Time);
 
       const points = (vals: (number | null)[]) => {
         const out: { time: Time; value: number }[] = [];
@@ -226,41 +326,60 @@ export function ChartPanel({ symbol }: { symbol: string }) {
         }
         return out;
       };
-      const addLine = (vals: (number | null)[], color: string, priceScaleId: string) => {
-        const line = ch.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, priceScaleId });
+      const addLine = (
+        vals: (number | null)[],
+        color: string,
+        priceScaleId: string,
+        fixedRange?: { min: number; max: number },
+      ) => {
+        const line = ch.addLineSeries({
+          color,
+          lineWidth: 1,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          priceScaleId,
+          // Bounded indicators (RSI) keep a meaningful pane even when the data
+          // only covers 45–55; the scale is pinned instead of autoscaled.
+          ...(fixedRange
+            ? { autoscaleInfoProvider: () => ({ priceRange: { minValue: fixedRange.min, maxValue: fixedRange.max } }) }
+            : {}),
+        });
         line.setData(points(vals));
         return line as ISeriesApi<SeriesType>;
       };
 
       for (const ind of inds) {
         if (!ind.visible) continue;
+        // Each oscillator gets its own scale so panes never share a range.
+        const scaleId = isOscillator(ind.type) ? ind.id : "right";
         const reused = indRef.current.get(ind.id);
         let series: ISeriesApi<SeriesType>[];
         if (ind.type === "sma" || ind.type === "ema") {
           const vals = ind.type === "ema" ? ema(closes, ind.period) : sma(closes, ind.period);
-          series = reused ?? [addLine(vals, ind.color || "#f59e0b", "right")];
+          series = reused ?? [addLine(vals, ind.color || "#f59e0b", scaleId)];
           if (reused) (reused[0] as ISeriesApi<"Line">).setData(points(vals));
         } else if (ind.type === "bb") {
           const { upper, middle, lower } = bollinger(closes, ind.period || 20, 2);
           const source = [upper, middle, lower];
-          series = reused ?? source.map((vals, idx) => addLine(vals, idx === 1 ? "rgba(245,158,11,0.5)" : "#f59e0b", "right"));
+          series = reused ?? source.map((vals, idx) => addLine(vals, idx === 1 ? "rgba(245,158,11,0.5)" : "#f59e0b", scaleId));
           if (reused) reused.forEach((s, idx) => (s as ISeriesApi<"Line">).setData(points(source[idx]!)));
         } else if (ind.type === "rsi") {
           const vals = rsi(closes, ind.period || 14);
-          series = reused ?? [addLine(vals, ind.color || "#8b5cf6", "rsi")];
+          series = reused ?? [addLine(vals, ind.color || "#8b5cf6", scaleId, { min: 0, max: 100 })];
           if (reused) (reused[0] as ISeriesApi<"Line">).setData(points(vals));
         } else if (ind.type === "macd") {
           const { macdLine, signalLine, histogram } = macd(closes);
+          const histData = points(histogram).map((p) => ({ ...p, color: p.value >= 0 ? "rgba(16,185,129,0.6)" : "rgba(244,63,94,0.6)" }));
           if (!reused) {
-            const line1 = addLine(macdLine, "#2196f3", "macd");
-            const line2 = addLine(signalLine, "#ff9800", "macd");
-            const hist = ch.addHistogramSeries({ priceScaleId: "macd" });
-            hist.setData(points(histogram).map((p) => ({ ...p, color: p.value >= 0 ? "rgba(16,185,129,0.6)" : "rgba(244,63,94,0.6)" })));
+            const line1 = addLine(macdLine, "#2196f3", scaleId);
+            const line2 = addLine(signalLine, "#ff9800", scaleId);
+            const hist = ch.addHistogramSeries({ priceScaleId: scaleId });
+            hist.setData(histData);
             series = [line1, line2, hist as ISeriesApi<SeriesType>];
           } else {
             (reused[0] as ISeriesApi<"Line">).setData(points(macdLine));
             (reused[1] as ISeriesApi<"Line">).setData(points(signalLine));
-            (reused[2] as ISeriesApi<"Histogram">).setData(points(histogram).map((p) => ({ ...p, color: p.value >= 0 ? "rgba(16,185,129,0.6)" : "rgba(244,63,94,0.6)" })));
+            (reused[2] as ISeriesApi<"Histogram">).setData(histData);
             series = reused;
           }
         } else {
@@ -275,29 +394,47 @@ export function ChartPanel({ symbol }: { symbol: string }) {
       for (const s of series) { try { ch.removeSeries(s); } catch { /* series already gone */ } }
     }
     indRef.current = wanted;
-  }, [klines, inds, st.showIndicators, chartEpoch]);
+    liveOscRef.current = oscIds.filter((id) => wanted.has(id));
+  }, [indRefresh, inds, st.showIndicators, symbol, tf, chartEpoch, oscIds]);
 
-  // ── Price scale layout + volume visibility (follows the toggles) ─────
+  // ── Price scale layout: price, volume and one band per oscillator ────
   useEffect(() => {
     const ch = chRef.current;
     if (!ch) return;
     const showVolume = st.showVolume;
-    // Reserve pane space: volume band at the bottom, oscillator band above it.
-    const bottom = 0.05 + (showVolume ? 0.2 : 0) + (osc ? (showVolume ? 0.15 : 0.35) : 0);
+    const volH = showVolume ? VOLUME_BAND : 0;
+    const oscTotal = Math.min(OSC_BAND * oscIds.length, 0.4);
+
+    // Reserve pane space: volume band at the bottom, oscillator bands above it.
+    const bottom = PRICE_PAD + volH + oscTotal;
     ch.priceScale("right").applyOptions({ scaleMargins: { top: 0.05, bottom } });
-    if (osc) {
-      const oscTop = Math.min(1 - bottom + 0.02, 0.9);
-      const oscOpts = { scaleMargins: { top: oscTop, bottom: showVolume ? 0.17 : 0.03 } };
-      ch.priceScale("rsi").applyOptions(oscOpts);
-      ch.priceScale("macd").applyOptions(oscOpts);
-    }
+    if (showVolume) ch.priceScale("volume").applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
+
+    const n = oscIds.length;
+    const band = n > 0 ? oscTotal / n : 0;
+    // Only scales that actually own a series: before the first candles arrive
+    // (boot, new symbol) no oscillator series exists, and configuring a scale
+    // with no series throws and takes the whole page down.
+    oscIds.forEach((id, i) => {
+      if (!liveOscRef.current.includes(id)) return;
+      const from = volH + i * band;
+      ch.priceScale(id).applyOptions({
+        scaleMargins: { top: Math.max(0.02, 1 - from - band), bottom: from },
+        borderVisible: false,
+      });
+    });
     vsRef.current?.applyOptions({ visible: showVolume });
-  }, [st.showVolume, osc, chartEpoch]);
+  }, [st.showVolume, oscIds, chartEpoch, indRefresh]);
 
   // ── Grid toggle (re-applied after chart recreation) ───────────────────
   useEffect(() => {
     chRef.current?.applyOptions({ grid: { vertLines: { visible: st.showGrid }, horzLines: { visible: st.showGrid } } });
   }, [st.showGrid, chartEpoch]);
+
+  // ── Auto-scale price axis ─────────────────────────────────────────────
+  useEffect(() => {
+    try { chRef.current?.priceScale("right").applyOptions({ autoScale: st.autoScale }); } catch { /* not ready */ }
+  }, [st.autoScale, chartEpoch]);
 
   // ── Scroll-back wiring ───────────────────────────────────────────────
   const loadOlder = useCallback(() => { void loadOlderKlines(symbol, tf); }, [symbol, tf]);
@@ -305,26 +442,50 @@ export function ChartPanel({ symbol }: { symbol: string }) {
 
   const retry = useCallback(() => { void loadHistoricalKlines(symbol, tf); }, [symbol, tf]);
 
+  // ── Reset view / jump back to the latest candle ──────────────────────
+  useEffect(() => {
+    const onReset = () => {
+      const ch = chRef.current;
+      if (!ch) return;
+      try {
+        ch.timeScale().resetTimeScale();
+        ch.timeScale().scrollToRealTime();
+      } catch { /* time scale not ready */ }
+      try { mainRef.current?.priceScale().applyOptions({ autoScale: true }); } catch { /* noop */ }
+    };
+    window.addEventListener(RESET_VIEW_EVENT, onReset);
+    return () => window.removeEventListener(RESET_VIEW_EVENT, onReset);
+  }, []);
+
   return (
     <div className="relative h-full w-full">
       <CrossInfo />
       <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} connected={connected} onRetry={retry} />
       <div ref={ref} className="h-full w-full" />
+      <DrawingLayer chartRef={chRef} mainRef={mainRef} symbol={symbol} epoch={chartEpoch} />
     </div>
   );
 }
 
+/** Its own component so a crosshair move re-renders just this OHLC strip; if it
+ *  lived inline, every pointer event would re-render the whole panel. */
 function CrossInfo() {
   const d = useChartStore((s) => s.crosshairData);
   const sym = useMarketStore((s) => s.symbol);
   return (
-    <div className="pointer-events-none absolute top-1 left-2 z-10 flex items-center gap-3 text-[11px] tabular-nums">
+    <div className="pointer-events-none absolute top-1 left-2 z-20 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] tabular-nums">
       {d && (<>
         <span style={{ color: "var(--text-muted)" }}>O <span style={{ color: "var(--text-secondary)" }}>{fmtPrice(d.open, sym)}</span></span>
         <span style={{ color: "var(--text-muted)" }}>H <span style={{ color: "var(--text-secondary)" }}>{fmtPrice(d.high, sym)}</span></span>
         <span style={{ color: "var(--text-muted)" }}>L <span style={{ color: "var(--text-secondary)" }}>{fmtPrice(d.low, sym)}</span></span>
         <span style={{ color: "var(--text-muted)" }}>C <span style={{ color: d.close >= d.open ? "var(--success)" : "var(--danger)" }}>{fmtPrice(d.close, sym)}</span></span>
+        {d.changePct != null && (
+          <span style={{ color: d.changePct >= 0 ? "var(--success)" : "var(--danger)" }}>
+            {d.changePct >= 0 ? "+" : ""}{d.changePct.toFixed(2)}%
+          </span>
+        )}
         {d.volume > 0 && (<span style={{ color: "var(--text-muted)" }}>V <span style={{ color: "var(--text-secondary)" }}>{fmtVolume(d.volume)}</span></span>)}
+        <span style={{ color: "var(--text-muted)" }}>{fmtTime(d.time)}</span>
       </>)}
     </div>
   );

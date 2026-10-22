@@ -1,14 +1,22 @@
 import { create } from "zustand";
-import type { Timeframe, ChartType, IndicatorConfig, Drawing, ChartTool, ChartSettings } from "@/lib/types";
+import type { Timeframe, ChartType, IndicatorConfig, Drawing, DrawingPoint, ChartTool, ChartSettings } from "@/lib/types";
+import { loadPersisted, persist, isRecord } from "@/lib/store/persist";
+import { TIMEFRAMES } from "@/lib/utils/klines";
+import { COLORS } from "@/lib/utils/drawings";
+
+/** One undo step: the whole drawing list of one symbol. */
+interface Snapshot { symbol: string; list: Drawing[] }
 
 interface ChartState {
   timeframe: Timeframe;
   chartType: ChartType;
   indicators: IndicatorConfig[];
-  drawings: Drawing[];
-  drawingHistory: Drawing[][];
-  drawingRedo: Drawing[][];
-  crosshairData: { time: number; open: number; high: number; low: number; close: number; volume: number } | null;
+  /** symbol -> drawings (persisted, so annotations survive reloads). */
+  drawingsBySymbol: Record<string, Drawing[]>;
+  past: Snapshot[];
+  future: Snapshot[];
+  selectedId: string | null;
+  crosshairData: { time: number; open: number; high: number; low: number; close: number; volume: number; changePct: number | null } | null;
   activeTool: ChartTool;
   settings: ChartSettings;
   fullscreen: boolean;
@@ -17,57 +25,162 @@ interface ChartState {
   setChartType: (ct: ChartType) => void;
   toggleIndicator: (id: string) => void;
   addIndicator: (ind: IndicatorConfig) => void;
+  updateIndicator: (id: string, patch: Partial<IndicatorConfig>) => void;
   removeIndicator: (id: string) => void;
   setCrosshairData: (d: ChartState["crosshairData"]) => void;
   setActiveTool: (t: ChartTool) => void;
   setFullscreen: (f: boolean) => void;
   updateSettings: (partial: Partial<ChartSettings>) => void;
-  addDrawing: (d: Drawing) => void;
-  removeDrawing: (id: string) => void;
-  clearDrawings: () => void;
-  undoDrawing: () => void;
-  redoDrawing: () => void;
+  selectDrawing: (id: string | null) => void;
+  beginDrawingHistory: (symbol: string) => void;
+  addDrawing: (symbol: string, d: Drawing) => void;
+  updateDrawingPoints: (symbol: string, id: string, points: DrawingPoint[]) => void;
+  updateDrawing: (symbol: string, id: string, patch: Partial<Drawing>) => void;
+  removeDrawing: (symbol: string, id: string) => void;
+  clearDrawings: (symbol: string) => void;
+  undoDrawings: () => void;
+  redoDrawings: () => void;
 }
 
-function loadPersisted<T>(key: string, fallback: T): T {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw) return JSON.parse(raw) as T;
-  } catch {}
-  return fallback;
+/** A cached value we can't type-check is worse than no cache: it reaches code
+ *  that assumes arrays and shapes, and the resulting render exception bricks
+ *  every reload. These guards keep the usable part of a blob and drop the rest. */
+
+const INDICATOR_TYPES = new Set<IndicatorConfig["type"]>(["sma", "ema", "rsi", "macd", "bb", "vol"]);
+const CHART_TYPES = new Set<ChartType>(["candlestick", "line", "area"]);
+const DRAWING_TYPES = new Set<Drawing["type"]>([
+  "horizontal", "vertical", "trendline", "ray", "fibonacci", "measure", "longPosition", "shortPosition",
+]);
+const TF_SET = new Set<string>(TIMEFRAMES);
+
+/** Default period per type, used only when a cached indicator lost its own. */
+function defaultPeriod(type: IndicatorConfig["type"]): number {
+  if (type === "rsi") return 14;
+  if (type === "ema") return 50;
+  return 20;
 }
 
-function persist(key: string, value: unknown) {
+/** Kept: `type` picks the series and `id` keys every later update, so an item
+ *  missing either cannot be rendered or toggled. */
+export function sanitizeIndicators(value: unknown): IndicatorConfig[] {
+  if (!Array.isArray(value)) return DEFAULT_INDICATORS;
+  const out: IndicatorConfig[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.id !== "string" || !item.id) continue;
+    const type = item.type;
+    if (typeof type !== "string" || !INDICATOR_TYPES.has(type as IndicatorConfig["type"])) continue;
+    if (out.some((i) => i.id === item.id)) continue;
+    const period = typeof item.period === "number" && Number.isFinite(item.period) && item.period > 0
+      ? Math.round(item.period)
+      : defaultPeriod(type as IndicatorConfig["type"]);
+    out.push({
+      id: item.id,
+      type: type as IndicatorConfig["type"],
+      period,
+      visible: item.visible !== false,
+      ...(typeof item.color === "string" && item.color ? { color: item.color } : {}),
+    });
+  }
+  return out;
+}
+
+function isDrawingPoint(value: unknown): value is DrawingPoint {
+  if (!isRecord(value)) return false;
+  const { time, price } = value;
+  return (typeof time === "number" && Number.isFinite(time)) && (typeof price === "number" && Number.isFinite(price));
+}
+
+/** Renderers branch on `points[1]`/`points[2]`, so a shape only has to carry
+ *  finite anchors; a shorter list just paints less. */
+function asDrawing(value: unknown, symbol: string): Drawing | null {
+  if (!isRecord(value) || typeof value.id !== "string" || !value.id) return null;
+  const type = value.type;
+  if (typeof type !== "string" || !DRAWING_TYPES.has(type as Drawing["type"])) return null;
+  if (typeof value.symbol === "string" && value.symbol !== symbol) return null;
+  if (!Array.isArray(value.points)) return null;
+  const points = value.points.filter(isDrawingPoint);
+  if (points.length < 1) return null;
+  return {
+    id: value.id,
+    type: type as Drawing["type"],
+    symbol,
+    points,
+    color: typeof value.color === "string" && value.color ? value.color : COLORS[type as Drawing["type"]],
+    ...(typeof value.locked === "boolean" ? { locked: value.locked } : {}),
+    ...(typeof value.visible === "boolean" ? { visible: value.visible } : {}),
+  };
+}
+
+/** A wrong-shaped blob (older build, hand-edited, half-written) loses the
+ *  affected entries instead of the whole annotation layer. */
+export function sanitizeDrawings(value: unknown): Record<string, Drawing[]> {
+  if (!isRecord(value)) return {};
+  const out: Record<string, Drawing[]> = {};
+  for (const [symbol, list] of Object.entries(value)) {
+    if (!Array.isArray(list)) continue;
+    const kept: Drawing[] = [];
+    for (const item of list) {
+      const d = asDrawing(item, symbol);
+      if (d && !kept.some((k) => k.id === d.id)) kept.push(d);
+    }
+    if (kept.length) out[symbol] = kept;
+  }
+  return out;
+}
+
+export function sanitizeSettings(value: unknown): ChartSettings {
+  const base: ChartSettings = { ...DEFAULT_SETTINGS };
+  if (!isRecord(value)) return base;
+  for (const key of ["showGrid", "showVolume", "showDrawings", "showIndicators", "autoScale"] as const) {
+    if (typeof value[key] === "boolean") base[key] = value[key] as boolean;
+  }
+  if (typeof value.chartType === "string" && CHART_TYPES.has(value.chartType as ChartType)) {
+    base.chartType = value.chartType as ChartType;
+  }
+  return base;
+}
+
+let drawingsWrite: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Drawings live in one localStorage blob, so a write costs a full JSON dump —
+ * and dragging an anchor fires one per frame. The in-memory store stays
+ * synchronous; only the disk write is deferred to the end of the gesture.
+ */
+function persistDrawings(value: Record<string, Drawing[]>) {
   if (typeof window === "undefined") return;
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  clearTimeout(drawingsWrite);
+  drawingsWrite = setTimeout(() => persist("ct_drawings", value), 150);
 }
+
+const MAX_HISTORY = 50;
+const MAX_PER_SYMBOL = 300;
 
 const DEFAULT_INDICATORS: IndicatorConfig[] = [
   { id: "sma20", type: "sma", period: 20, visible: true, color: "#f59e0b" },
   { id: "ema50", type: "ema", period: 50, visible: false, color: "#8b5cf6" },
 ];
 
-export const useChartStore = create<ChartState>((set) => ({
-  timeframe: loadPersisted("ct_tf", "1m") as Timeframe,
-  chartType: loadPersisted("ct_ct", "candlestick") as ChartType,
-  indicators: loadPersisted("ct_inds", DEFAULT_INDICATORS),
-  drawings: [],
-  drawingHistory: [[]],
-  drawingRedo: [],
+const DEFAULT_SETTINGS: ChartSettings = {
+  chartType: "candlestick",
+  showGrid: true,
+  showVolume: true,
+  showDrawings: true,
+  showIndicators: true,
+  autoScale: true,
+};
+
+export const useChartStore = create<ChartState>((set, get) => ({
+  timeframe: loadPersisted<Timeframe>("ct_tf", "1m", (v): v is Timeframe => typeof v === "string" && TF_SET.has(v)),
+  chartType: loadPersisted<ChartType>("ct_ct", "candlestick", (v): v is ChartType => typeof v === "string" && CHART_TYPES.has(v as ChartType)),
+  indicators: sanitizeIndicators(loadPersisted<unknown>("ct_inds", DEFAULT_INDICATORS)),
+  drawingsBySymbol: sanitizeDrawings(loadPersisted<unknown>("ct_drawings", {})),
+  past: [],
+  future: [],
+  selectedId: null,
   crosshairData: null,
   activeTool: "crosshair",
   fullscreen: false,
-  settings: loadPersisted("ct_settings", {
-    chartType: "candlestick",
-    showGrid: true,
-    showVolume: true,
-    showDrawings: true,
-    showIndicators: true,
-    autoScale: true,
-    magnetMode: false,
-    lockDrawings: false,
-  } as ChartSettings),
+  settings: sanitizeSettings(loadPersisted<unknown>("ct_settings", DEFAULT_SETTINGS)),
 
   setTimeframe: (timeframe) => { persist("ct_tf", timeframe); set({ timeframe }); },
   setChartType: (chartType) => { persist("ct_ct", chartType); set((s) => ({ chartType, settings: { ...s.settings, chartType } })); },
@@ -79,6 +192,12 @@ export const useChartStore = create<ChartState>((set) => ({
       return { indicators };
     }),
   addIndicator: (ind) => set((s) => { const indicators = [...s.indicators, ind]; persist("ct_inds", indicators); return { indicators }; }),
+  updateIndicator: (id, patch) =>
+    set((s) => {
+      const indicators = s.indicators.map((i) => (i.id === id ? { ...i, ...patch } : i));
+      persist("ct_inds", indicators);
+      return { indicators };
+    }),
   removeIndicator: (id) =>
     set((s) => {
       const indicators = s.indicators.filter((i) => i.id !== id);
@@ -86,8 +205,24 @@ export const useChartStore = create<ChartState>((set) => ({
       return { indicators };
     }),
 
-  setCrosshairData: (crosshairData) => set({ crosshairData }),
-  setActiveTool: (activeTool) => set({ activeTool }),
+  /**
+   * Publishes the hovered OHLC. Called on every crosshair move — far more
+   * often than the hovered bar (or its values) actually changes, so an
+   * identical payload is dropped instead of re-rendering the legend.
+   */
+  setCrosshairData: (crosshairData) => {
+    const cur = get().crosshairData;
+    if (cur === crosshairData || (!cur && !crosshairData)) return;
+    if (
+      cur && crosshairData &&
+      cur.time === crosshairData.time && cur.open === crosshairData.open &&
+      cur.high === crosshairData.high && cur.low === crosshairData.low &&
+      cur.close === crosshairData.close && cur.volume === crosshairData.volume &&
+      cur.changePct === crosshairData.changePct
+    ) return;
+    set({ crosshairData });
+  },
+  setActiveTool: (activeTool) => set({ activeTool, selectedId: null }),
   setFullscreen: (fullscreen) => set({ fullscreen }),
   updateSettings: (partial) =>
     set((s) => {
@@ -96,36 +231,108 @@ export const useChartStore = create<ChartState>((set) => ({
       return { settings };
     }),
 
-  addDrawing: (d) =>
-    set((s) => ({
-      drawings: [...s.drawings, d],
-      drawingHistory: [...s.drawingHistory, [...s.drawings, d]],
-      drawingRedo: [],
-    })),
-  removeDrawing: (id) =>
+  selectDrawing: (selectedId) => set({ selectedId }),
+
+  /** Snapshot the current list so a drag (many point updates) is one undo step. */
+  beginDrawingHistory: (symbol) =>
+    set((s) => ({ past: [...s.past, { symbol, list: s.drawingsBySymbol[symbol] ?? [] }].slice(-MAX_HISTORY), future: [] })),
+
+  addDrawing: (symbol, d) =>
     set((s) => {
-      const next = s.drawings.filter((d) => d.id !== id);
-      return { drawings: next, drawingHistory: [...s.drawingHistory, next], drawingRedo: [] };
+      const cur = s.drawingsBySymbol[symbol] ?? [];
+      const next = [...cur, d].slice(-MAX_PER_SYMBOL);
+      persistDrawings({ ...s.drawingsBySymbol, [symbol]: next });
+      return {
+        drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: next },
+        past: [...s.past, { symbol, list: cur }].slice(-MAX_HISTORY),
+        future: [],
+        selectedId: d.id,
+      };
     }),
-  clearDrawings: () =>
-    set((s) => ({
-      drawings: [],
-      drawingHistory: [...s.drawingHistory, []],
-      drawingRedo: [],
-    })),
-  undoDrawing: () =>
+
+  updateDrawingPoints: (symbol, id, points) =>
     set((s) => {
-      if (s.drawingHistory.length <= 1) return {};
-      const hist = [...s.drawingHistory];
-      hist.pop();
-      const drawings = hist[hist.length - 1]!;
-      return { drawings, drawingHistory: hist, drawingRedo: [...s.drawingRedo, s.drawings] };
+      const cur = s.drawingsBySymbol[symbol];
+      if (!cur) return {};
+      const target = cur.find((d) => d.id === id);
+      if (!target || target.locked) return {};
+      const next = cur.map((d) => (d.id === id ? { ...d, points } : d));
+      persistDrawings({ ...s.drawingsBySymbol, [symbol]: next });
+      return { drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: next } };
     }),
-  redoDrawing: () =>
+
+  updateDrawing: (symbol, id, patch) =>
     set((s) => {
-      if (s.drawingRedo.length === 0) return {};
-      const redo = [...s.drawingRedo];
-      const next = redo.pop()!;
-      return { drawings: next, drawingHistory: [...s.drawingHistory, next], drawingRedo: redo };
+      const cur = s.drawingsBySymbol[symbol];
+      if (!cur) return {};
+      const next = cur.map((d) => (d.id === id ? { ...d, ...patch } : d));
+      persistDrawings({ ...s.drawingsBySymbol, [symbol]: next });
+      return { drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: next } };
     }),
+
+  removeDrawing: (symbol, id) =>
+    set((s) => {
+      const cur = s.drawingsBySymbol[symbol] ?? [];
+      const next = cur.filter((d) => d.id !== id);
+      if (next.length === cur.length) return {};
+      persistDrawings({ ...s.drawingsBySymbol, [symbol]: next });
+      return {
+        drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: next },
+        past: [...s.past, { symbol, list: cur }].slice(-MAX_HISTORY),
+        future: [],
+        selectedId: s.selectedId === id ? null : s.selectedId,
+      };
+    }),
+
+  clearDrawings: (symbol) =>
+    set((s) => {
+      const cur = s.drawingsBySymbol[symbol] ?? [];
+      if (cur.length === 0) return {};
+      const bySymbol = { ...s.drawingsBySymbol, [symbol]: [] };
+      persistDrawings(bySymbol);
+      return {
+        drawingsBySymbol: bySymbol,
+        past: [...s.past, { symbol, list: cur }].slice(-MAX_HISTORY),
+        future: [],
+        selectedId: null,
+      };
+    }),
+
+  undoDrawings: () => {
+    const s = get();
+    const step = s.past[s.past.length - 1];
+    if (!step) return;
+    const current = s.drawingsBySymbol[step.symbol] ?? [];
+    const bySymbol = { ...s.drawingsBySymbol, [step.symbol]: step.list };
+    persistDrawings(bySymbol);
+    set({
+      drawingsBySymbol: bySymbol,
+      past: s.past.slice(0, -1),
+      future: [...s.future, { symbol: step.symbol, list: current }].slice(-MAX_HISTORY),
+      selectedId: null,
+    });
+  },
+
+  redoDrawings: () => {
+    const s = get();
+    const step = s.future[s.future.length - 1];
+    if (!step) return;
+    const current = s.drawingsBySymbol[step.symbol] ?? [];
+    const bySymbol = { ...s.drawingsBySymbol, [step.symbol]: step.list };
+    persistDrawings(bySymbol);
+    set({
+      drawingsBySymbol: bySymbol,
+      future: s.future.slice(0, -1),
+      past: [...s.past, { symbol: step.symbol, list: current }].slice(-MAX_HISTORY),
+      selectedId: null,
+    });
+  },
 }));
+
+const EMPTY_DRAWINGS: Drawing[] = [];
+
+/** Selector helper: returns the shared EMPTY_DRAWINGS constant when a symbol
+ *  has none, so subscribers keep a stable reference across store updates. */
+export function selectDrawings(state: ChartState, symbol: string): Drawing[] {
+  return state.drawingsBySymbol[symbol] ?? EMPTY_DRAWINGS;
+}

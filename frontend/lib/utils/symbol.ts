@@ -4,6 +4,8 @@
  * Display format: BTC/USDT.
  */
 
+import type { InstrumentInfo, SymbolPrecision } from "@/lib/types";
+
 /** Strip slash → "BTC/USDT" → "BTCUSDT" */
 export function normalizeSymbol(input: string): string {
   return input.replace(/[^A-Z0-9]/gi, "").toUpperCase();
@@ -33,52 +35,36 @@ export function quoteAsset(_symbol: string): string {
   return "USDT";
 }
 
-// ── Price precision per asset ───────────────────────────────────────────
-// Bybit spot has specific tick sizes per symbol.
-const PRECISION_MAP: Record<string, [priceDec: number, qtyDec: number]> = {
-  BTC: [2, 5],
-  ETH: [2, 4],
-  BNB: [2, 3],
-  SOL: [2, 2],
-  XRP: [5, 1],
-  DOGE: [6, 0],
-  SHIB: [8, 0],
-  PEPE: [8, 0],
-  ADA: [5, 1],
-  AVAX: [3, 2],
-  DOT: [4, 2],
-  LINK: [3, 2],
-  MATIC: [5, 1],
-  UNI: [3, 2],
-  LTC: [3, 3],
-  FIL: [3, 2],
-  NEAR: [4, 1],
-  APT: [3, 2],
-  ARB: [5, 1],
-  OP: [4, 1],
-  TRX: [6, 0],
-  ATOM: [4, 2],
-  ICP: [3, 2],
-  FET: [5, 1],
-  SEI: [5, 1],
-  WLD: [4, 1],
-  TON: [4, 2],
-  BONK: [8, 0],
-  PEPE2: [8, 0],
-};
+// ── Price precision per instrument ────────────────────────────────────
+// Filled from the gateway's instrument metadata (Bybit tick size / lot size),
+// which is the only source that is both complete and correct — a hand-kept map
+// drifts and mis-formats prices (BTC ticks at 0.1, not the 0.01 this file used
+// to claim).
+const registry = new Map<string, SymbolPrecision>();
+const DEFAULT_PRECISION: SymbolPrecision = { priceDecimals: 4, qtyDecimals: 2 };
 
-const DEFAULT_PRECISION: [number, number] = [4, 2];
+/** Replaces the whole map from the gateway's `symbols` envelope. Called on
+ *  every instrument refresh, so a delisted pair stops being formatted here. */
+export function setInstruments(instruments: InstrumentInfo[]) {
+  registry.clear();
+  for (const i of instruments) {
+    registry.set(normalizeSymbol(i.symbol), { priceDecimals: i.priceDecimals, qtyDecimals: i.qtyDecimals });
+  }
+}
+
+/** Unknown symbols (a stale watchlist entry, SSR before the envelope lands)
+ *  fall back to DEFAULT_PRECISION rather than showing raw venue strings. */
+export function precisionFor(symbol?: string): SymbolPrecision {
+  if (!symbol) return DEFAULT_PRECISION;
+  return registry.get(normalizeSymbol(symbol)) ?? DEFAULT_PRECISION;
+}
 
 export function getPriceDecimals(symbol?: string): number {
-  if (!symbol) return DEFAULT_PRECISION[0];
-  const base = baseAsset(symbol);
-  return (PRECISION_MAP[base] ?? DEFAULT_PRECISION)[0];
+  return precisionFor(symbol).priceDecimals;
 }
 
 export function getQtyDecimals(symbol?: string): number {
-  if (!symbol) return DEFAULT_PRECISION[1];
-  const base = baseAsset(symbol);
-  return (PRECISION_MAP[base] ?? DEFAULT_PRECISION)[1];
+  return precisionFor(symbol).qtyDecimals;
 }
 
 /** Format price with exchange-aware decimals. */

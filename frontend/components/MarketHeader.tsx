@@ -1,54 +1,88 @@
 "use client";
 import { useRef, useEffect } from "react";
-import { useMarketStore } from "@/lib/store/marketStore";
+import { useMarketStore, selectBestBid, selectBestAsk } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
-import { fmtPrice, fmtPct, fmtVolume } from "@/lib/utils/format";
+import { fmtPct, fmtPrice, fmtVolume } from "@/lib/utils/format";
 import { baseAsset } from "@/lib/utils/symbol";
 import { CoinIcon } from "@/components/CoinIcon";
-import type { Timeframe } from "@/lib/types";
-const TF: Timeframe[] = ["1m","3m","5m","15m","30m","1h","4h","1d","1w"];
+import { TIMEFRAMES } from "@/lib/utils/klines";
+
 export function MarketHeader({ symbol }: { symbol: string }) {
   const ticker = useMarketStore((s) => s.tickers[symbol]);
+  // Bybit's ticker stream omits bid/ask, so read the top of the live book.
+  const bestBid = useMarketStore((s) => selectBestBid(s, symbol));
+  const bestAsk = useMarketStore((s) => selectBestAsk(s, symbol));
   const tf = useChartStore((s) => s.timeframe);
   const setTf = useChartStore((s) => s.setTimeframe);
   const prevPrice = useRef(parseFloat(ticker?.lastPrice || "0"));
   const flashRef = useRef<HTMLSpanElement>(null);
+
   const lastPrice = ticker?.lastPrice;
   useEffect(() => {
     if (!lastPrice) return;
     const cur = parseFloat(lastPrice);
     if (cur !== prevPrice.current && flashRef.current) {
-      flashRef.current.classList.remove("flash-text-green","flash-text-red");
+      flashRef.current.classList.remove("flash-text-green", "flash-text-red");
       void flashRef.current.offsetWidth;
       flashRef.current.classList.add(cur > prevPrice.current ? "flash-text-green" : "flash-text-red");
     }
     prevPrice.current = cur;
   }, [lastPrice]);
+
   const change = ticker ? parseFloat(ticker.change24h) : 0;
-  const pctVal = Math.abs(change) < 1 ? change * 100 : change;
-  const up = pctVal >= 0;
+  const up = change >= 0;
   const color = up ? "var(--success)" : "var(--danger)";
+
   return (
-    <div className="flex items-center gap-3 border-b px-3 py-2" style={{ borderColor: "var(--border)" }}>
-      <CoinIcon symbol={symbol} size="md" />
-      <div className="flex items-center gap-1">
+    <div className="no-select flex flex-shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b px-3 py-2" style={{ borderColor: "var(--border)", background: "var(--bg-primary)" }}>
+      <div className="flex items-center gap-2">
+        <CoinIcon symbol={symbol} size="md" />
         <span className="text-sm font-bold" style={{ color: "var(--text-primary)" }}>{baseAsset(symbol)}</span>
-        <span className="text-sm" style={{ color: "var(--text-muted)" }}>/USDT</span>
+        <span className="text-xs" style={{ color: "var(--text-muted)" }}>/ USDT</span>
       </div>
-      {ticker && (<>
-        <span ref={flashRef} className="text-sm font-semibold tabular-nums" style={{ color }}>{fmtPrice(ticker.lastPrice, symbol)}</span>
-        <span className="text-xs tabular-nums" style={{ color }}>{fmtPct(change)}</span>
-        {ticker.bidPrice && <span className="text-[11px] tabular-nums" style={{ color: "var(--success)" }}>Bid {fmtPrice(ticker.bidPrice, symbol)}</span>}
-        {ticker.askPrice && <span className="text-[11px] tabular-nums" style={{ color: "var(--danger)" }}>Ask {fmtPrice(ticker.askPrice, symbol)}</span>}
-        <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>H <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{fmtPrice(ticker.high24h, symbol)}</span></span>
-        <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>L <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{fmtPrice(ticker.low24h, symbol)}</span></span>
-        <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>Vol <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{fmtVolume(ticker.volume24h)}</span></span>
-      </>)}
+
+      {ticker ? (
+        <>
+          <div className="flex items-baseline gap-2">
+            <span ref={flashRef} className="text-base font-semibold tabular-nums" style={{ color }}>{fmtPrice(ticker.lastPrice, symbol)}</span>
+            <span className="text-xs font-medium tabular-nums" style={{ color }}>{fmtPct(change)}</span>
+          </div>
+          <div className="hidden items-center gap-3 text-[11px] md:flex">
+            <Stat label="24h High" value={fmtPrice(ticker.high24h, symbol)} />
+            <Stat label="24h Low" value={fmtPrice(ticker.low24h, symbol)} />
+            <Stat label="24h Vol" value={fmtVolume(ticker.volume24h)} />
+            {ticker.turnover24h && <Stat label="Turnover" value={fmtVolume(ticker.turnover24h)} />}
+            {bestBid != null && <Stat label="Bid" value={fmtPrice(bestBid, symbol)} valueColor="var(--success)" />}
+            {bestAsk != null && <Stat label="Ask" value={fmtPrice(bestAsk, symbol)} valueColor="var(--danger)" />}
+          </div>
+        </>
+      ) : (
+        <span className="text-xs" style={{ color: "var(--text-muted)" }}>waiting for market data…</span>
+      )}
+
       <div className="flex-1" />
-      <div className="flex items-center gap-0.5">
-        {TF.map((t) => (<button key={t} onClick={() => setTf(t)} className="px-2 py-0.5 text-[11px] font-medium rounded transition-colors"
-          style={{ background: tf === t ? "color-mix(in srgb, var(--accent) 15%, transparent)" : "transparent", color: tf === t ? "var(--accent)" : "var(--text-muted)" }}>{t}</button>))}
+
+      <div className="flex items-center gap-0.5 overflow-x-auto">
+        {TIMEFRAMES.map((t) => (
+          <button
+            key={t}
+            onClick={() => setTf(t)}
+            data-active={tf === t}
+            className="seg-btn font-medium"
+          >
+            {t}
+          </button>
+        ))}
       </div>
     </div>
+  );
+}
+
+function Stat({ label, value, valueColor }: { label: string; value: string; valueColor?: string }) {
+  return (
+    <span className="flex items-baseline gap-1" style={{ color: "var(--text-muted)" }}>
+      {label}
+      <span className="tabular-nums" style={{ color: valueColor || "var(--text-secondary)" }}>{value}</span>
+    </span>
   );
 }

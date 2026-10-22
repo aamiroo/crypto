@@ -25,6 +25,9 @@ const inFlightBackfill = new Set<string>();
 const backfillCooldown = new Map<string, number>();
 const backfillExhausted = new Set<string>();
 
+/** The single call site for /api/klines. Throws on any failure — HTTP status,
+ *  a gateway `error` body, or a non-array payload — so callers can read a throw
+ *  as "retry/abort" and an empty array as a genuine "no more history". */
 async function fetchKlineBatch(
   symbol: string,
   interval: Timeframe | string,
@@ -83,6 +86,9 @@ export async function loadHistoricalKlines(symbol: string, interval: Timeframe |
 export async function loadOlderKlines(symbol: string, interval: Timeframe | string, limit = BACKFILL_LIMIT): Promise<boolean> {
   const key = klineKey(symbol, interval);
   if (inFlightBackfill.has(key) || backfillExhausted.has(key)) return false;
+  // Backfilling before the recent window has landed is a wasted full page:
+  // with only live candles on screen the viewport already looks "at the start".
+  if (useMarketStore.getState().klineStatus[key]?.state !== "ready") return false;
   const lastAttempt = backfillCooldown.get(key);
   if (lastAttempt !== undefined && Date.now() - lastAttempt < BACKFILL_COOLDOWN_MS) return false;
 
