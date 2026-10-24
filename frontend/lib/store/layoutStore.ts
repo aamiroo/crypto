@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import type { LayoutState } from "@/lib/types";
-import { loadPersisted, persist } from "@/lib/store/persist";
+import { loadPersisted, persist, isRecord } from "@/lib/store/persist";
 
 const KEY = "ct_layout";
 
@@ -19,8 +19,21 @@ interface LayoutStore extends LayoutState {
   reset: () => void;
 }
 
+/** Only the three known fields are taken from the cache; a stale or hand-edited
+ *  blob must not smuggle a non-number width or a non-boolean flag into layout. */
+function sanitizeLayout(value: unknown): LayoutState {
+  const base = { ...DEFAULTS };
+  if (!isRecord(value)) return base;
+  if (typeof value.watchlistOpen === "boolean") base.watchlistOpen = value.watchlistOpen;
+  if (typeof value.rightPanelOpen === "boolean") base.rightPanelOpen = value.rightPanelOpen;
+  if (typeof value.watchlistWidth === "number" && Number.isFinite(value.watchlistWidth)) {
+    base.watchlistWidth = clamp(value.watchlistWidth, WATCHLIST_MIN, WATCHLIST_MAX);
+  }
+  return base;
+}
+
 export const useLayoutStore = create<LayoutStore>((set) => ({
-  ...loadPersisted<LayoutState>(KEY, DEFAULTS),
+  ...sanitizeLayout(loadPersisted<unknown>(KEY, DEFAULTS)),
 
   toggle: (panel) =>
     set((s) => {

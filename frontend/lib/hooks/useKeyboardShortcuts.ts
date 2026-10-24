@@ -70,7 +70,12 @@ export function useKeyboardShortcuts() {
         window.dispatchEvent(new Event(RESET_VIEW_EVENT));
         return;
       }
-      if (TOOL_KEYS[k] && !e.ctrlKey && !e.metaKey) { chart.setActiveTool(TOOL_KEYS[k]!); return; }
+      const tool = TOOL_KEYS[k];
+      if (tool && !e.ctrlKey && !e.metaKey) {
+        // Same key again = flip "keep armed", matching a second click on the rail.
+        chart.setActiveTool(tool, chart.activeTool === tool ? !chart.stickyTool : false);
+        return;
+      }
 
       const n = parseInt(e.key, 10);
       if (!e.ctrlKey && !e.metaKey && n >= 1 && n <= TIMEFRAMES.length) {
@@ -100,6 +105,8 @@ export const SHORTCUTS: ShortcutDef[] = [
   { keys: "K", label: "Short position tool" },
   { keys: "Ctrl/⌘ Z", label: "Undo drawing" },
   { keys: "Ctrl/⌘ Y", label: "Redo drawing" },
+  { keys: "Tool key again", label: "Keep the tool armed for repeated drawing" },
+  { keys: "Right-click a drawing", label: "Lock / hide / delete menu" },
   { keys: "Del", label: "Delete selected drawing" },
   { keys: "Esc", label: "Cancel tool / close dialog" },
   { keys: "?", label: "Show this help" },

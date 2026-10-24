@@ -55,7 +55,14 @@ export async function fetchSpotTickers() {
     signal: AbortSignal.timeout(10000),
     headers: { "User-Agent": "Mozilla/5.0 (compatible; CryptoTerminal/1.0)" },
   });
-  if (!r.ok) throw new Error(`Bybit HTTP ${r.status}`);
+  if (!r.ok) {
+    const err = new Error(`Bybit HTTP ${r.status}`);
+    // 403/451 on the unfiltered list is Bybit's CDN refusing our region
+    // ("block access from your country"), not a transient fault — per-symbol
+    // requests still succeed. Retrying the bulk call only spams the log.
+    err.blocked = r.status === 403 || r.status === 451;
+    throw err;
+  }
   const j = await r.json();
   if (j.retCode !== 0) throw new Error(j.retMsg || `Bybit error ${j.retCode}`);
   const list = Array.isArray(j.result?.list) ? j.result.list : [];
@@ -85,6 +92,8 @@ export function publishTickers(tickers, knownSymbols) {
  */
 export function startTickerSeed({ logger, getSymbols, intervalMs = 20000 }) {
   let running = false;
+  let failures = 0;
+  let timer = null;
   const tick = async () => {
     if (running) return;
     running = true;
@@ -92,15 +101,25 @@ export function startTickerSeed({ logger, getSymbols, intervalMs = 20000 }) {
       const tickers = await fetchSpotTickers();
       const known = new Set(getSymbols());
       const n = publishTickers(tickers, known);
+      failures = 0;
       logger.info("ticker seed published", { fromRest: tickers.length, published: n });
     } catch (err) {
-      logger.warn("ticker seed failed", { err: err.message });
+      if (err.blocked) {
+        logger.warn("ticker seed disabled: bulk snapshot blocked by venue CDN, prices continue from the ws ticker stream");
+        clearInterval(timer);
+        timer = null;
+        return;
+      }
+      // A venue hiccup should not turn into one warning line per interval:
+      // report the first failure and then every tenth.
+      failures += 1;
+      if (failures === 1 || failures % 10 === 0) logger.warn("ticker seed failed", { err: err.message, failures });
     } finally {
       running = false;
     }
   };
   void tick();
-  const timer = setInterval(tick, intervalMs);
+  timer = setInterval(tick, intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  return () => { if (timer) clearInterval(timer); timer = null; };
 }

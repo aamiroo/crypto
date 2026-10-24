@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 interface PopoverProps {
   label: ReactNode;
@@ -14,32 +15,60 @@ interface PopoverProps {
 }
 
 /**
- * Accessible-ish dropdown: opens on click, closes on outside click / Escape.
- * Renders the trigger and an absolutely-positioned panel.
+ * Dropdown that opens on click and closes on outside click / Escape.
+ *
+ * The panel is portalled to `document.body` and pinned with fixed coordinates:
+ * the chart toolbar scrolls horizontally, and `overflow-x: auto` forces
+ * `overflow-y` to auto too, which would clip an in-flow panel to the 38px-tall
+ * bar — the indicator and settings menus were invisible for that reason.
  */
 export function Popover({ label, tooltip, align = "left", width, active, className, title, children }: PopoverProps) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const el = triggerRef.current;
+    if (!el) { setOpen(false); return; }
+    const r = el.getBoundingClientRect();
+    const w = width ?? 200;
+    const left = align === "right" ? r.right - w : r.left;
+    setPos({
+      left: Math.max(6, Math.min(left, window.innerWidth - w - 6)),
+      top: Math.min(r.bottom + 5, Math.max(6, window.innerHeight - 44)),
+    });
+  }, [open, width, align]);
 
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t) || triggerRef.current?.contains(t)) return;
+      setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    // Pinned coordinates go stale as soon as anything moves under the panel.
+    const close = () => setOpen(false);
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
     return () => {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
     };
   }, [open]);
 
   return (
-    <div className="relative" ref={ref}>
+    <>
       <button
+        ref={triggerRef}
         type="button"
-        title={title}
+        title={title ?? tooltip}
         aria-haspopup="menu"
         aria-expanded={open}
         data-tooltip={tooltip}
@@ -49,15 +78,17 @@ export function Popover({ label, tooltip, align = "left", width, active, classNa
       >
         {label}
       </button>
-      {open && (
+      {open && pos && createPortal(
         <div
-          className="popover"
+          ref={panelRef}
+          className="popover popover-pinned"
           role="menu"
-          style={{ [align]: 0, top: "calc(100% + 5px)", width: width ? `${width}px` : undefined } as React.CSSProperties}
+          style={{ left: pos.left, top: pos.top, width: width ? `${width}px` : undefined }}
         >
           {children(() => setOpen(false))}
-        </div>
+        </div>,
+        document.body,
       )}
-    </div>
+    </>
   );
 }

@@ -18,6 +18,20 @@ export const MAX_KLINES = 5000;
 export const TIMEFRAMES: Timeframe[] = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
 const TF_SET = new Set<string>(TIMEFRAMES);
 
+/** Bar duration in ms. Used to judge whether a stored window still reaches the
+ *  present, which is what decides if it needs a REST refresh. */
+export const TIMEFRAME_SPAN_MS: Record<Timeframe, number> = {
+  "1m": 60_000,
+  "3m": 180_000,
+  "5m": 300_000,
+  "15m": 900_000,
+  "30m": 1_800_000,
+  "1h": 3_600_000,
+  "4h": 14_400_000,
+  "1d": 86_400_000,
+  "1w": 604_800_000,
+};
+
 const MIN_OPEN_TIME = 946684800000; // 2000-01-01
 const MAX_OPEN_TIME = 4102444800000; // 2100-01-01
 
@@ -265,4 +279,25 @@ export function diffKlines(prev: KlineData[], next: KlineData[]): KlineDiff {
 export function hasOscillator(indicators: { type: string; visible: boolean }[], showIndicators: boolean): boolean {
   if (!showIndicators) return false;
   return indicators.some((i) => i.visible && (i.type === "rsi" || i.type === "macd"));
+}
+
+/** Candles shown right after a timeframe switch. The previous zoom window is
+ *  measured in the *old* bar size, so reusing it can leave one or two candles
+ *  on screen — which looks exactly like a chart that failed to load. */
+export const SWITCH_VISIBLE_BARS = 120;
+/** Empty slots kept to the right of the newest bar (matches the chart's
+ *  `rightOffset`), so the last candle is never glued to the price axis. */
+export const SWITCH_RIGHT_PAD = 10;
+
+/**
+ * Logical (index-based) range to show after a timeframe change: newest bars
+ *  right-aligned, at most SWITCH_VISIBLE_BARS of them. `from` is clamped at 0
+ *  because a short window has nothing to the left to show.
+ */
+export function switchVisibleRange(count: number): { from: number; to: number } {
+  if (count <= 0) return { from: 0, to: SWITCH_RIGHT_PAD };
+  return {
+    from: Math.max(0, count - SWITCH_VISIBLE_BARS),
+    to: count + SWITCH_RIGHT_PAD,
+  };
 }

@@ -1,16 +1,17 @@
 import http from "node:http";
 import { WebSocketServer } from "ws";
 import { Hub } from "./hub.js";
+import { INTERVALS, intervalMs } from "../intervals.js";
+import { createKlinesStore } from "./klinesStore.js";
 import { bus, subject } from "../bus.js";
 
 const WS_PATH = "/ws";
-const BYBIT_REST = "https://api.bybit.com";
+const BYBIT_REST = process.env.BYBIT_REST || "https://api.bybit.com";
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
-const INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
 const CHANNELS = ["orderbook", "trades", "kline", "ticker"];
 const SYMBOL_RE = /^[A-Z0-9]{3,20}$/;
 const MAX_KLINES = 1000;
@@ -25,12 +26,6 @@ const APP_TO_BYBIT = {
 function cors(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json", ...CORS });
   res.end(JSON.stringify(body));
-}
-
-/** Length of one candle in ms; an unknown interval means the 1m default. */
-function ivMs(iv) {
-  return { "1m": 6e4, "3m": 18e4, "5m": 3e5, "15m": 9e5, "30m": 18e5,
-    "1h": 36e5, "4h": 144e5, "1d": 864e5, "1w": 6048e5 }[iv] || 6e4;
 }
 
 /** Reject anything that is not a well-formed instrument id before it reaches
@@ -64,86 +59,118 @@ const KLINES_CACHE_TTL_MS = 2000;
 const KLINES_MIN_SPACING_MS = 150; // minimum gap between outbound Bybit calls
 const KLINES_CIRCUIT_MS = 8000; // cool-off after a 403/429 before retrying Bybit
 const KLINES_CACHE_MAX = 400;
-const klinesCache = new Map(); // key -> { at, data }
-const klinesInflight = new Map(); // key -> Promise
-let klinesTail = Promise.resolve(); // serializes outbound Bybit requests
-let klinesLastOut = 0;
-let klinesCircuitUntil = 0;
+/** One window must cost the browser seconds, not tens of them: it blocks on
+ *  this request, and past the budget the gateway answers from its own cache. */
+const KLINES_ATTEMPTS = 3;
+const KLINES_ATTEMPT_TIMEOUT_MS = 4000;
+const KLINES_BUDGET_MS = 7000;
 
-// Bybit punishes concurrent/rapid REST bursts with HTTP 403. The client can
-// legitimately fire several kline requests at once (remounts, timeframe
-// switches, older-page loads), so we dedupe identical requests, serve a tiny
-// cache, serialize outbound calls with a minimum spacing, and — crucially —
-// never *amplify* a rate-limit: after a 403/429 we pause all outbound requests
-// for a cool-off window instead of hammering the limiter into a longer ban.
-function enqueueKlines(task) {
-  const run = klinesTail.then(task, task);
-  klinesTail = run.then(() => {}, () => {});
-  return run;
-}
-
-/** Wait for the shared outbound slot: the cool-off window first, then the
- *  minimum spacing between two Bybit calls. */
-async function pauseForBybit() {
-  const now = Date.now();
-  if (klinesCircuitUntil > now) {
-    await new Promise((r) => setTimeout(r, Math.min(klinesCircuitUntil - now, KLINES_CIRCUIT_MS)));
-  }
-  const since = Date.now() - klinesLastOut;
-  if (since < KLINES_MIN_SPACING_MS) {
-    await new Promise((r) => setTimeout(r, KLINES_MIN_SPACING_MS - since));
-  }
-  klinesLastOut = Date.now();
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * History for one (symbol, interval, limit, endTime) window. Identical requests
- * share one upstream call, so a client burst costs one round trip; the caller
- * always gets candles, never a Bybit error shape.
+ * The `/api/klines` upstream path: request de-duplication, a tiny cache and a
+ * serialized, budget-bounded retry queue.
+ *
+ * Bybit punishes concurrent/rapid REST bursts with HTTP 403, while the client
+ * legitimately fires several kline requests at once (remounts, timeframe
+ * switches, older-page loads). So identical requests share one upstream call,
+ * outbound calls are spaced, and after a 403/429 the queue pauses for a
+ * cool-off instead of hammering the limiter into a longer ban.
+ *
+ * `store` holds the last window the venue actually served. A venue failure is
+ * no reason to hand the terminal an empty chart — historical candles never
+ * change and the live tail arrives over the websocket — so the cache fallback
+ * is both safe and useful, including right after a restart.
  */
-function fetchKlines(symbol, interval, limit, endTime) {
-  const key = `${symbol}|${interval}|${limit}|${endTime || ""}`;
-  const cached = klinesCache.get(key);
-  if (cached && Date.now() - cached.at < KLINES_CACHE_TTL_MS) {
-    return Promise.resolve(cached.data);
+function createKlinesFetcher({ store, logger }) {
+  const cache = new Map(); // key -> { at, data }
+  const inflight = new Map(); // key -> Promise
+  let tail = Promise.resolve(); // serializes outbound Bybit requests
+  let lastOut = 0;
+  let circuitUntil = 0;
+  let circuitErr = null; // why the cool-off was opened, for the first request inside it
+
+  function enqueue(task) {
+    const run = tail.then(task, task);
+    tail = run.then(() => {}, () => {});
+    return run;
   }
-  const inflight = klinesInflight.get(key);
-  if (inflight) return inflight;
 
-  const task = enqueueKlines(async () => {
-    let lastErr;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await pauseForBybit();
-      try {
-        const data = await fetchKlinesOnce(symbol, interval, limit, endTime);
-        klinesCircuitUntil = 0;
-        klinesCache.set(key, { at: Date.now(), data });
-        if (klinesCache.size > KLINES_CACHE_MAX) {
-          for (const [k, v] of klinesCache) {
-            if (Date.now() - v.at > KLINES_CACHE_TTL_MS) klinesCache.delete(k);
-          }
-          // Still oversized (a burst of distinct keys): keep the newest entries.
-          while (klinesCache.size > KLINES_CACHE_MAX) {
-            klinesCache.delete(klinesCache.keys().next().value);
-          }
-        }
-        return data;
-      } catch (err) {
-        lastErr = err;
-        const limited = /403|429/.test(err.message);
-        if (limited) klinesCircuitUntil = Date.now() + KLINES_CIRCUIT_MS;
-        const retriable = limited || /fetch failed|timeout|ECONN|socket/i.test(err.message);
-        if (!retriable || attempt === 2) throw err;
-        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
-      }
+  /** Wait for the shared outbound slot: the cool-off first, then the minimum
+   *  spacing between two Bybit calls. False when the cool-off outlasts what is
+   *  left of the budget, i.e. stop trying rather than overrun or re-probe. */
+  async function pause(budgetLeftMs) {
+    const coolOff = circuitUntil - Date.now();
+    if (coolOff >= budgetLeftMs) return false;
+    if (coolOff > 0) await sleep(coolOff);
+    const since = Date.now() - lastOut;
+    if (since < KLINES_MIN_SPACING_MS) await sleep(KLINES_MIN_SPACING_MS - since);
+    lastOut = Date.now();
+    return true;
+  }
+
+  /** Drop entries the client is not asking for any more, then, if a burst of
+   *  distinct keys still left us oversized, keep the newest. */
+  function trimCache() {
+    if (cache.size <= KLINES_CACHE_MAX) return;
+    for (const [k, v] of cache) {
+      if (Date.now() - v.at > KLINES_CACHE_TTL_MS) cache.delete(k);
     }
-    throw lastErr;
-  }).finally(() => {
-    klinesInflight.delete(key);
-  });
+    while (cache.size > KLINES_CACHE_MAX) cache.delete(cache.keys().next().value);
+  }
 
-  klinesInflight.set(key, task);
-  return task;
+  function fetchKlines(symbol, interval, limit, endTime) {
+    const key = `${symbol}|${interval}|${limit}|${endTime || ""}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < KLINES_CACHE_TTL_MS) return Promise.resolve(hit.data);
+    const pending = inflight.get(key);
+    if (pending) return pending;
+
+    const task = enqueue(async () => {
+      const started = Date.now();
+      let lastErr;
+      for (let attempt = 0; attempt < KLINES_ATTEMPTS; attempt++) {
+        const left = KLINES_BUDGET_MS - (Date.now() - started);
+        if (left <= KLINES_MIN_SPACING_MS) break;
+        if (!(await pause(left))) break;
+        try {
+          const data = await fetchFromVenue(symbol, interval, limit, endTime,
+            Math.min(KLINES_ATTEMPT_TIMEOUT_MS, left));
+          circuitUntil = 0;
+          circuitErr = null;
+          cache.set(key, { at: Date.now(), data });
+          trimCache();
+          // Only the window ending "now" is a usable fallback; an older
+          // backfill page must not overwrite it.
+          if (!endTime) store?.remember(symbol, interval, data);
+          return data;
+        } catch (err) {
+          lastErr = err;
+          if (/403|429/.test(err.message)) {
+            circuitUntil = Date.now() + KLINES_CIRCUIT_MS;
+            circuitErr = err;
+          } else if (!/fetch failed|timeout|ECONN|socket|abort/i.test(err.message)) throw err;
+        }
+      }
+      // Only the current window can be answered from cache: an older backfill
+      // page served from the recent window would be filtered away by the client
+      // as "nothing older", silently ending scroll-back at the wrong place.
+      const fallback = endTime ? null : store?.candles(symbol, interval, limit);
+      const reason = lastErr ?? circuitErr;
+      if (fallback && fallback.length) {
+        logger.warn("klines served from cache", {
+          symbol, interval, err: String(reason?.message ?? reason ?? "budget"),
+        });
+        return fallback;
+      }
+      throw reason ?? new Error("Bybit request unavailable");
+    }).finally(() => inflight.delete(key));
+
+    inflight.set(key, task);
+    return task;
+  }
+
+  return { fetchKlines };
 }
 
 /**
@@ -151,7 +178,7 @@ function fetchKlines(symbol, interval, limit, endTime) {
  * chronological order and the envelope shape are normalised here — clients
  * never see the venue's ordering.
  */
-async function fetchKlinesOnce(symbol, interval, limit, endTime) {
+async function fetchFromVenue(symbol, interval, limit, endTime, timeoutMs) {
   const params = new URLSearchParams({
     category: "spot",
     symbol,
@@ -161,7 +188,7 @@ async function fetchKlinesOnce(symbol, interval, limit, endTime) {
   // Optional backfill window: candles strictly before `endTime` (ms).
   if (endTime) params.set("end", String(endTime));
   const r = await fetch(`${BYBIT_REST}/v5/market/kline?${params}`, {
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(timeoutMs),
     headers: { "User-Agent": "Mozilla/5.0 (compatible; CryptoTerminal/1.0)" },
   });
   if (!r.ok) throw new Error(`Bybit HTTP ${r.status}`);
@@ -169,7 +196,8 @@ async function fetchKlinesOnce(symbol, interval, limit, endTime) {
   if (j.retCode !== 0) throw new Error(j.retMsg || `Bybit error ${j.retCode}`);
   const list = j.result?.list;
   if (!Array.isArray(list)) throw new Error("No kline data");
-  const ms = ivMs(interval);
+  const ms = intervalMs(interval);
+  const now = Date.now();
   // Bybit returns newest-first; reverse for chronological order
   return list.reverse().map((c) => ({
     interval,
@@ -180,8 +208,43 @@ async function fetchKlinesOnce(symbol, interval, limit, endTime) {
     low: String(c[3]),
     close: String(c[4]),
     volume: String(c[5]),
-    closed: true,
+    // The last row of every window is the candle still forming. Labelling it
+    // closed makes the client treat a partial bar as final and let a REST
+    // refresh rewind the live one.
+    closed: Number(c[0]) + ms <= now,
   }));
+}
+
+/**
+ * Keep the cached windows of *watched* pairs fresh without the client asking.
+ *
+ * The venue rejects some periods outright — its CDN refuses a share of
+ * connections from some networks, and which ones it lets through changes over
+ * minutes. A chart that only loads when the user happens to press Retry is the
+ * "loading never works" the terminal gets blamed for, so the gateway re-pulls
+ * the recent window for the pairs clients are actually viewing until it lands,
+ * and serves that cache in the meantime.
+ *
+ * Rate limits still apply: this goes through the same serialized queue, so a
+ * 403 cool-off silences it for a whole round rather than adding pressure.
+ */
+export function startKlineWindowRefresh({ refreshWindow, demand, intervalMs, logger }) {
+  let running = false;
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      // An idle terminal has no demand, so this loop sends nothing at all.
+      for (const [symbol, interval] of demand()) await refreshWindow(symbol, interval);
+    } catch (err) {
+      logger.warn("kline window refresh failed", { err: err.message });
+    } finally {
+      running = false;
+    }
+  };
+  const timer = setInterval(() => void tick(), intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 /**
@@ -191,11 +254,15 @@ async function fetchKlinesOnce(symbol, interval, limit, endTime) {
  * @param collector    Optional collector, synced to whichever symbol a client
  *                     selects (orderbook/trades/kline are heavy, so they are
  *                     only streamed on demand)
+ * @param klines       Last-good candle windows (see klinesStore.js); created per
+ *                     gateway when the host has no loaded one to pass in
  */
-export function createGateway(instruments, venues, logger, collector) {
+export function createGateway(instruments, venues, logger, collector, klines) {
   const hub = new Hub(logger);
   const server = http.createServer();
   const bridged = new Set();
+  const klinesStore = klines ?? createKlinesStore({ logger });
+  const fetchKlines = createKlinesFetcher({ store: klinesStore, logger }).fetchKlines;
 
   /* ── bus → hub bridge ────────────────────────────────────────── */
   function bridge(symbol) {
@@ -279,6 +346,27 @@ export function createGateway(instruments, venues, logger, collector) {
     }
     collector?.sync([...syms], pairs);
   }
+
+  /** The (symbol, interval) pairs clients are watching, without duplicates. */
+  const klineDemand = () => {
+    const out = new Map();
+    for (const m of clientKline.values()) {
+      for (const [sym, iv] of m) out.set(`${sym}|${iv}`, [sym, iv]);
+    }
+    return [...out.values()];
+  };
+
+  // 500 matches the window size the terminal requests on open, so a refresh
+  // fills exactly the cache entry the next client request reads.
+  const stopKlineRefresh = startKlineWindowRefresh({
+    intervalMs: Number(process.env.KLINE_REFRESH_MS || 20000),
+    logger,
+    demand: klineDemand,
+    refreshWindow: async (symbol, interval) => {
+      try { await fetchKlines(symbol, interval, 500, null); }
+      catch { /* the client's own request is what reports a failure */ }
+    },
+  });
 
   /** One error shape for every unknown-symbol path (input is echoed truncated). */
   function rejectSymbol(client, raw) {
@@ -365,10 +453,10 @@ export function createGateway(instruments, venues, logger, collector) {
     ws.on("error", (err) => { logger.warn("ws error", { err: err.message }); release(); });
   });
 
-  wss.on("close", () => hub.stop());
-  server.on("close", () => hub.stop());
+  wss.on("close", () => { stopKlineRefresh(); hub.stop(); });
+  server.on("close", () => { stopKlineRefresh(); hub.stop(); });
 
-  return { server, hub, syncBridge };
+  return { server, hub, syncBridge, klines: klinesStore };
 }
 
 /** Protocol error envelope: `{ code, message }` (see docs/PROTOCOL.md). Clients

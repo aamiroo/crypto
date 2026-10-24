@@ -133,7 +133,180 @@ body {
   padding: 6px;
 }
 
+.popover-pinned { position: fixed; }
+
 .divider-v { width: 1px; align-self: stretch; margin: 5px 3px; background: var(--border); }
+
+/* ── Drawing tool rail ────────────────────────────────────── */
+/* A recessed glass strip: the rail reads as one control, and the armed tool
+   gets a lit pill instead of the old flat tint that was hard to notice. */
+.tool-rail {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-surface) 70%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+}
+.rail-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  color: var(--text-secondary);
+  transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+.rail-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.rail-btn[data-active="true"] {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.rail-btn-wide { width: auto; gap: 2px; padding: 0 4px; }
+
+/* Keep-armed badge: a pinned tool draws shape after shape, so it has to look
+   different from a tool that returns to the cursor after one click. */
+.rail-btn[data-sticky="true"]::after,
+.sticky-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--accent);
+}
+.rail-btn[data-sticky="true"]::after {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+}
+.rail-btn[data-sticky="true"]::after { position: absolute; right: 3px; bottom: 3px; }
+
+/* Tool flyout rows: icon, name, what it expects, shortcut. */
+.tool-menu-title {
+  padding: 2px 6px 4px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.tool-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  text-align: left;
+  color: var(--text-secondary);
+}
+.tool-menu-item:hover { background: var(--bg-hover); }
+.tool-menu-item[data-active="true"] {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.tool-kbd {
+  flex-shrink: 0;
+  padding: 1px 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+.tool-menu-foot {
+  margin-top: 3px;
+  padding: 4px 6px 2px;
+  border-top: 1px solid var(--border);
+  font-size: 9px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* Armed-tool status strip over the chart: the toolbar clips anything that
+   hangs below it, so the live state and its controls live here instead. */
+.armed-strip {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 8px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.armed-strip button {
+  padding: 1px 5px;
+  border-radius: 5px;
+  color: var(--text-muted);
+}
+.armed-strip button:hover { background: var(--bg-hover); color: var(--text-primary); }
+.armed-strip button[data-active="true"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* Instruction label that rides beside the pointer while a tool is armed.
+   Fixed-size on purpose so the clamp() positioning stays predictable. */
+.cursor-label {
+  position: absolute;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 3px 8px;
+  font-size: 10px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Right-click menu on a drawing, positioned inside the chart area. */
+.ctx-menu {
+  position: absolute;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 3px;
+  font-size: 11px;
+}
+.ctx-title {
+  padding: 3px 7px 4px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  text-align: left;
+  color: var(--text-secondary);
+}
+.ctx-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* Floating cards over the chart (drawings list, selection actions). */
+.glass-card {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-elevated) 82%, transparent);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
 
 /* Resize handles */
 .resize-handle { position: relative; z-index: 30; }

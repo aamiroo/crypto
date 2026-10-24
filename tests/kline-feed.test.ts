@@ -1,7 +1,7 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { useMarketStore, selectKlines } from "../frontend/lib/store/marketStore.ts";
-import { loadHistoricalKlines, loadOlderKlines } from "../frontend/lib/api/klines.ts";
+import { loadHistoricalKlines, loadOlderKlines, refreshRecentKlines, hasRecentTail } from "../frontend/lib/api/klines.ts";
 import { EMPTY_KLINES, MAX_KLINES, klineKey, normalizeKlines } from "../frontend/lib/utils/klines.ts";
 import type { Envelope } from "../frontend/lib/types.ts";
 
@@ -200,8 +200,8 @@ test("loadOlderKlines: fetches a window ending at the oldest candle and merges",
 
   assert.equal(await loadOlderKlines(sym, "1m"), true);
   assert.ok(
-    fetchCalls[0]!.includes(`endTime=${oldestBefore}`),
-    `backfill must ask for data before the oldest candle: ${fetchCalls[0]}`,
+    fetchCalls[0]!.includes(`endTime=${oldestBefore - 1}`),
+    `backfill must ask for the page strictly before the oldest candle: ${fetchCalls[0]}`,
   );
   const ks = getKlines(sym);
   assert.equal(ks.length, 150);
@@ -209,27 +209,36 @@ test("loadOlderKlines: fetches a window ending at the oldest candle and merges",
   assert.equal(ks[0]!.openTime, BASE + 950 * MIN);
 });
 
-test("loadOlderKlines: is rate-limited by cooldown", async () => {
+test("loadOlderKlines: a good page is followed up at once, a failed one waits", async () => {
   const sym = "O2";
   seedWindow(sym, 2000, 100);
   // Always serve 50 candles strictly older than whatever the window's oldest is.
-  fetchResponder = () => {
+  const olderPage = () => {
     const oldest = getKlines(sym)[0]!.openTime;
     return okBatch(Array.from({ length: 50 }, (_, i) => raw(oldest - (50 - i) * MIN)));
   };
+  fetchResponder = olderPage;
 
-  // limit=50 with a full 50-row page => not exhausted, so the cooldown is what
-  // blocks the follow-up call.
+  // limit=50 with a full 50-row page => not exhausted. Scroll-back has to keep
+  // walking, so a successful page must not throttle the next one.
   assert.equal(await loadOlderKlines(sym, "1m", 50), true);
-  const calls = fetchCalls.length;
-  assert.equal(await loadOlderKlines(sym, "1m", 50), false, "immediate second call blocked by cooldown");
-  assert.equal(fetchCalls.length, calls, "no extra fetch issued");
+  const afterFirst = fetchCalls.length;
+  assert.equal(await loadOlderKlines(sym, "1m", 50), true, "next page fetched immediately");
+  assert.equal(fetchCalls.length, afterFirst + 1, "follow-up page issued");
+
+  // An unreachable gateway is a different story: one failed page buys a backoff,
+  // otherwise every scroll tick re-requests a page that cannot arrive.
+  fetchResponder = () => ({ ok: false, status: 502, body: { error: "Bybit HTTP 403" } });
+  assert.equal(await loadOlderKlines(sym, "1m", 50), false);
+  const afterFailure = fetchCalls.length;
+  assert.equal(await loadOlderKlines(sym, "1m", 50), false, "backoff after a failed page");
+  assert.equal(fetchCalls.length, afterFailure, "no fetch issued during backoff");
 
   const realNow = Date.now;
   try {
-    Date.now = () => realNow() + 5_000;
-    assert.equal(await loadOlderKlines(sym, "1m", 50), true);
-    assert.equal(fetchCalls.length, calls + 1);
+    Date.now = () => realNow() + 6_000;
+    fetchResponder = olderPage;
+    assert.equal(await loadOlderKlines(sym, "1m", 50), true, "fetches again once the backoff expires");
   } finally {
     Date.now = realNow;
   }
@@ -275,4 +284,67 @@ test("loadOlderKlines: waits for the recent window instead of backfilling live b
 test("loadOlderKlines: no existing data -> no fetch", async () => {
   assert.equal(await loadOlderKlines("O5_UNKNOWN", "1m"), false);
   assert.equal(fetchCalls.length, 0);
+});
+
+// ── tail refresh: the right-hand edge must keep reaching the present ──────
+
+/** openTime of the bar `minutesAgo` minutes back, aligned to the 1m grid. */
+function nowBar(minutesAgo: number, interval = "1m"): number {
+  const span = interval === "1h" ? 3_600_000 : 60_000;
+  return Math.floor((Date.now() - minutesAgo * span) / span) * span;
+}
+
+/** Seed a window around the present the way a finished load leaves it. */
+function seedRecent(symbol: string, minutesAgo: number[], interval = "1m") {
+  useMarketStore.getState().mergeKlinesInto(
+    symbol,
+    interval,
+    normalizeKlines(minutesAgo.map((m) => raw(nowBar(m), "105", interval)), interval),
+  );
+  useMarketStore.getState().setKlineStatus(symbol, interval, "ready");
+}
+
+test("hasRecentTail: judges a window by its newest bar, not its length", () => {
+  assert.equal(hasRecentTail([]), false, "an empty window is not live");
+  assert.equal(hasRecentTail(normalizeKlines([raw(BASE + MIN)], "1m")), false, "2023 data is stale");
+  assert.equal(hasRecentTail(normalizeKlines([raw(nowBar(10)), raw(nowBar(9))], "1m")), false);
+  assert.equal(hasRecentTail(normalizeKlines([raw(nowBar(2))], "1m")), true);
+  // A 4h bar opened 3h ago still covers now, so it must not be re-pulled.
+  assert.equal(hasRecentTail(normalizeKlines([raw(nowBar(3, "4h"), "105", "4h")], "4h")), true);
+});
+
+test("refreshRecentKlines: leaves a live window alone", async () => {
+  const sym = "R1";
+  seedRecent(sym, [3, 2, 1]);
+  assert.equal(await refreshRecentKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 0, "no round trip when the chart already reaches now");
+});
+
+test("refreshRecentKlines: re-pulls a tail that stopped advancing", async () => {
+  const sym = "R2";
+  seedRecent(sym, [12, 11, 10]); // frozen ten minutes ago
+  assert.equal(hasRecentTail(getKlines(sym)), false);
+
+  fetchResponder = () => okBatch([nowBar(2), nowBar(1)].map((t) => raw(t)));
+  assert.equal(await refreshRecentKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 1);
+  assert.ok(hasRecentTail(getKlines(sym)), "the healed window reaches the present");
+});
+
+test("refreshRecentKlines: stays out of the way while a load is pending or failing", async () => {
+  const sym = "R3";
+  seedRecent(sym, [20, 19]);
+  useMarketStore.getState().setKlineStatus(sym, "1m", "error", "Bybit HTTP 403");
+  assert.equal(await refreshRecentKlines(sym, "1m"), false);
+  assert.equal(fetchCalls.length, 0, "the retry ladder owns this window");
+});
+
+test("refreshRecentKlines: rate-limits so repeated events cannot re-arm the ladder", async () => {
+  const sym = "R4";
+  seedRecent(sym, [30, 29]);
+  // Gateway keeps answering from a stale cache, so the tail stays frozen.
+  fetchResponder = () => okBatch([raw(nowBar(25))]);
+  assert.equal(await refreshRecentKlines(sym, "1m"), false);
+  assert.equal(await refreshRecentKlines(sym, "1m"), false);
+  assert.equal(fetchCalls.length, 1, "the second call falls inside the refresh floor");
 });

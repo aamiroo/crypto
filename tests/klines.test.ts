@@ -13,6 +13,9 @@ import {
   toLineBars,
   toVolumeBars,
   buildTimeIndex,
+  switchVisibleRange,
+  SWITCH_VISIBLE_BARS,
+  SWITCH_RIGHT_PAD,
 } from "../frontend/lib/utils/klines.ts";
 import type { KlineData } from "../frontend/lib/types.ts";
 
@@ -227,4 +230,25 @@ test("klineKey is stable and unique per window", () => {
 test("EMPTY_KLINES is a stable empty reference", () => {
   assert.equal(EMPTY_KLINES.length, 0);
   assert.deepEqual(EMPTY_KLINES, []);
+});
+
+test("switchVisibleRange right-aligns a sane number of bars for any window", () => {
+  // Nothing loaded yet: an empty chart still needs a positive-width viewport,
+  // otherwise the first page lands on a zero-bar range and looks like a failure.
+  assert.deepEqual(switchVisibleRange(0), { from: 0, to: SWITCH_RIGHT_PAD });
+  // Shorter than the target window -> show all of it from index 0.
+  assert.deepEqual(switchVisibleRange(50), { from: 0, to: 50 + SWITCH_RIGHT_PAD });
+  assert.deepEqual(switchVisibleRange(500), {
+    from: 500 - SWITCH_VISIBLE_BARS,
+    to: 500 + SWITCH_RIGHT_PAD,
+  });
+
+  for (const count of [1, 2, 119, 120, 121, 1000, MAX_KLINES]) {
+    const r = switchVisibleRange(count);
+    assert.ok(r.from >= 0, `from clamped below 0 for ${count}`);
+    assert.ok(r.to > r.from, `zero-width window for ${count}`);
+    // The newest bar is always inside the window, with pad to its right.
+    assert.ok(r.to > count, `newest bar outside the window for ${count}`);
+    assert.ok(r.to - r.from >= Math.min(count, SWITCH_VISIBLE_BARS));
+  }
 });

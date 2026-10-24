@@ -5,7 +5,7 @@ import { MarketWSClient } from "@/lib/ws/client";
 import { useMarketStore } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
 import { toast } from "@/lib/store/toastStore";
-import { loadHistoricalKlines } from "@/lib/api/klines";
+import { loadHistoricalKlines, refreshRecentKlines } from "@/lib/api/klines";
 import type { SymbolsData } from "@/lib/types";
 
 const GATEWAY_WS_URL =
@@ -25,6 +25,9 @@ export function useMarketFeed() {
   const symbolRef = useRef<string>("");
   const intervalRef = useRef<string>("");
   const tickerSubs = useRef<Set<string>>(new Set());
+  /** Set when the socket drops, cleared by the history re-pull that follows the
+   *  next connect — so a reconnect heals the gap exactly once. */
+  const droppedRef = useRef(false);
   const applyEnvelope = useMarketStore((s) => s.applyEnvelope);
   const setConnected = useMarketStore((s) => s.setConnected);
 
@@ -85,14 +88,35 @@ export function useMarketFeed() {
         if (e?.code) toast("warning", e.message || e.code);
       }
     });
-    const unsubState = client.onStateChange(setConnected);
+    const unsubState = client.onStateChange((connected) => {
+      setConnected(connected);
+      // The hub only replays its ring buffer, so everything the venue published
+      // while the socket was down is gone for good. Re-pull the recent window
+      // after a dropout, otherwise the hole stays at the right-hand edge of the
+      // chart forever. (The first connect needs no re-pull: the symbol and
+      // timeframe effects below already do that load.)
+      if (!connected) { droppedRef.current = true; return; }
+      if (!droppedRef.current) return;
+      droppedRef.current = false;
+      void loadHistoricalKlines(useMarketStore.getState().symbol, useChartStore.getState().timeframe);
+    });
 
     client.connect();
+
+    // A hidden tab throttles timers and socket handling without the client ever
+    // seeing a drop, so the newest candle can silently stop advancing. Re-check
+    // the tail on the way back (refreshRecentKlines no-ops when it is current).
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      void refreshRecentKlines(useMarketStore.getState().symbol, useChartStore.getState().timeframe);
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
     const activeTickerSubs = tickerSubs.current;
     return () => {
       unsubMessage();
       unsubState();
+      document.removeEventListener("visibilitychange", onVisible);
       client.disconnect();
       setConnected(false);
       activeTickerSubs.clear();

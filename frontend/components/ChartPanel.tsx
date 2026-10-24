@@ -9,13 +9,14 @@ import { getPriceDecimals } from "@/lib/utils/symbol";
 import { useThemeStore } from "@/lib/store/themeStore";
 import type { ThemeName } from "@/lib/types";
 import {
-  EMPTY_KLINES, buildTimeIndex, diffKlines, klineKey,
+  EMPTY_KLINES, buildTimeIndex, diffKlines, klineKey, switchVisibleRange,
   toCandleBars, toLineBars, toVolumeBars,
 } from "@/lib/utils/klines";
 import { loadHistoricalKlines, loadOlderKlines } from "@/lib/api/klines";
 import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
 import { DrawingLayer } from "@/components/DrawingLayer";
-import type { ChartType, IndicatorConfig, KlineData } from "@/lib/types";
+import { DrawingsPanel } from "@/components/DrawingsPanel";
+import type { ChartType, IndicatorConfig, KlineData, Timeframe } from "@/lib/types";
 
 /** Literal colors, not CSS variables: lightweight-charts paints on a canvas and
  *  cannot resolve `var(...)`, so the theme has to be flattened before it is set. */
@@ -63,6 +64,10 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   const idxRef = useRef<Map<Time, number>>(new Map());
   const loadOlderRef = useRef<(() => void) | null>(null);
   const ctRef = useRef<ChartType | null>(null);
+  /** The timeframe the rendered viewport was fitted for. */
+  const tfRef = useRef<Timeframe | null>(null);
+  /** Set by a timeframe switch; cleared once the switched-to window has landed. */
+  const fitPendingRef = useRef(false);
   const visRef = useRef<string>("");
   const [chartEpoch, setChartEpoch] = useState(0);
   const [indRefresh, setIndRefresh] = useState(0);
@@ -235,9 +240,32 @@ export function ChartPanel({ symbol }: { symbol: string }) {
       return;
     }
 
+    // A timeframe switch invalidates the current zoom: the visible window was
+    // measured in the *old* bar size, so reusing it on 4h candles after being
+    // zoomed in on 1m leaves one or two bars on screen — indistinguishable from
+    // a chart that failed to load. The REST page normally lands *after* the live
+    // tail, so keep re-fitting on structural changes until this timeframe's load
+    // settles; `tail` updates never touch the viewport, so panning stays put.
+    const refitForTimeframe = (): boolean => {
+      if (klines.length === 0) return false;
+      if (tfRef.current !== tf) {
+        tfRef.current = tf;
+        fitPendingRef.current = true;
+      }
+      if (!fitPendingRef.current) return false;
+      // Stay pending while the switch's window is still arriving: the live tail
+      // lands first, and fitting to it alone would strand the view on a handful
+      // of candles once the 500-bar page merges in.
+      if (status?.state === "ready") fitPendingRef.current = false;
+      try { timeScale.setVisibleLogicalRange(switchVisibleRange(klines.length)); }
+      catch { timeScale.scrollToRealTime(); }
+      return true;
+    };
+
     if (plan.kind === "tail") {
       // Same window, only the newest bars changed: cheap incremental update,
-      // viewport untouched so panning/zooming never jumps.
+      // viewport left alone so panning/zooming never jumps (a timeframe switch
+      // is the one case that must re-fit, handled below).
       for (let i = plan.from; i < klines.length; i++) {
         const k = klines[i]!;
         const t = Math.floor(k.openTime / 1000) as Time;
@@ -254,29 +282,31 @@ export function ChartPanel({ symbol }: { symbol: string }) {
         order.set(t, i);
       }
       lastRef.current = klines;
+      refitForTimeframe();
       return;
     }
 
     // full / first: structural change — restore the viewport where possible.
     applyFull();
-
     const bars = klines;
-    if (plan.kind === "full" && plan.shift > 0 && logicalRange) {
-      // Older history was prepended: shift indexes so the view stays put.
-      timeScale.setVisibleLogicalRange({ from: logicalRange.from + plan.shift, to: logicalRange.to + plan.shift });
-    } else if (timeRange && bars.length > 0) {
-      // Our times are always UTCTimestamp (seconds) — compare as numbers.
-      const rangeFrom = Number(timeRange.from);
-      const rangeTo = Number(timeRange.to);
-      const first = Math.floor(bars[0]!.openTime / 1000);
-      const last = Math.floor(bars[bars.length - 1]!.openTime / 1000);
-      if (first <= rangeFrom && last >= rangeTo) {
-        try { timeScale.setVisibleRange(timeRange); } catch { timeScale.scrollToRealTime(); }
-      } else {
+    if (!refitForTimeframe()) {
+      if (plan.kind === "full" && plan.shift > 0 && logicalRange) {
+        // Older history was prepended: shift indexes so the view stays put.
+        timeScale.setVisibleLogicalRange({ from: logicalRange.from + plan.shift, to: logicalRange.to + plan.shift });
+      } else if (timeRange && bars.length > 0) {
+        // Our times are always UTCTimestamp (seconds) — compare as numbers.
+        const rangeFrom = Number(timeRange.from);
+        const rangeTo = Number(timeRange.to);
+        const first = Math.floor(bars[0]!.openTime / 1000);
+        const last = Math.floor(bars[bars.length - 1]!.openTime / 1000);
+        if (first <= rangeFrom && last >= rangeTo) {
+          try { timeScale.setVisibleRange(timeRange); } catch { timeScale.scrollToRealTime(); }
+        } else {
+          timeScale.scrollToRealTime();
+        }
+      } else if (bars.length > 0) {
         timeScale.scrollToRealTime();
       }
-    } else if (bars.length > 0) {
-      timeScale.scrollToRealTime();
     }
 
     lastRef.current = bars;
@@ -284,7 +314,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     const order = new Map<Time, number>();
     for (let i = 0; i < bars.length; i++) order.set(Math.floor(bars[i]!.openTime / 1000) as Time, i);
     idxRef.current = order;
-  }, [klines, ct, theme, chartEpoch]);
+  }, [klines, tf, status, ct, theme, chartEpoch]);
 
   // ── Indicators: stable series registry, refreshed at most 1×/s ───────
   useEffect(() => {
@@ -463,6 +493,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
       <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} connected={connected} onRetry={retry} />
       <div ref={ref} className="h-full w-full" />
       <DrawingLayer chartRef={chRef} mainRef={mainRef} symbol={symbol} epoch={chartEpoch} />
+      <DrawingsPanel symbol={symbol} />
     </div>
   );
 }

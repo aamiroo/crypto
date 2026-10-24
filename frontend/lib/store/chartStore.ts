@@ -18,6 +18,10 @@ interface ChartState {
   selectedId: string | null;
   crosshairData: { time: number; open: number; high: number; low: number; close: number; volume: number; changePct: number | null } | null;
   activeTool: ChartTool;
+  /** Keeps a placement tool armed after a shape finishes (double-click the rail
+   *  button). Off by default: the familiar behaviour is finish -> the new shape
+   *  is handed to the cursor with its handles showing. */
+  stickyTool: boolean;
   settings: ChartSettings;
   fullscreen: boolean;
 
@@ -28,7 +32,8 @@ interface ChartState {
   updateIndicator: (id: string, patch: Partial<IndicatorConfig>) => void;
   removeIndicator: (id: string) => void;
   setCrosshairData: (d: ChartState["crosshairData"]) => void;
-  setActiveTool: (t: ChartTool) => void;
+  setActiveTool: (t: ChartTool, sticky?: boolean) => void;
+  setStickyTool: (sticky: boolean) => void;
   setFullscreen: (f: boolean) => void;
   updateSettings: (partial: Partial<ChartSettings>) => void;
   selectDrawing: (id: string | null) => void;
@@ -179,6 +184,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   selectedId: null,
   crosshairData: null,
   activeTool: "crosshair",
+  stickyTool: false,
   fullscreen: false,
   settings: sanitizeSettings(loadPersisted<unknown>("ct_settings", DEFAULT_SETTINGS)),
 
@@ -222,7 +228,9 @@ export const useChartStore = create<ChartState>((set, get) => ({
     ) return;
     set({ crosshairData });
   },
-  setActiveTool: (activeTool) => set({ activeTool, selectedId: null }),
+  setActiveTool: (activeTool, sticky = false) =>
+    set({ activeTool, selectedId: null, stickyTool: activeTool !== "crosshair" && sticky }),
+  setStickyTool: (stickyTool) => set({ stickyTool }),
   setFullscreen: (fullscreen) => set({ fullscreen }),
   updateSettings: (partial) =>
     set((s) => {

@@ -1,4 +1,5 @@
 import { createGateway } from "./gateway/server.js";
+import { createKlinesStore } from "./gateway/klinesStore.js";
 import { Instruments } from "./instruments.js";
 import { BybitCollector } from "./collector/bybit.js";
 import { startTickerSeed } from "./collector/tickers.js";
@@ -41,7 +42,10 @@ const symbols = instruments.symbols;
 log.info("starting", { symbolCount: symbols.length, source: instruments.source, port });
 
 const collector = new BybitCollector(log);
-const { server } = createGateway(instruments, ["bybit"], log, collector);
+// The last candle windows the venue served, so a REST outage or a restart does
+// not leave the terminal without history.
+const klines = await createKlinesStore({ logger: log }).load();
+const { server } = createGateway(instruments, ["bybit"], log, collector, klines);
 
 // Bybit's spot ticker stream only pushes for pairs that trade, so seed the
 // Hub's "latest" cache from REST and keep refreshing quiet pairs.
@@ -54,7 +58,7 @@ const stopTickerSeed = startTickerSeed({
 void collector.run(symbols);
 
 server.listen(port, () => {
-  log.info("gateway listening", { port, path: "/ws" });
+  log.info("gateway listening", { port, path: "/ws", klineWindows: klines.size() });
 });
 
 /** Order matters: stop producing (ticker seed, collector sockets) before the
@@ -63,6 +67,9 @@ function shutdown() {
   stopTickerSeed();
   collector.close();
   server.close();
+  // The candle-window mirror is debounced; flush it so a restart still has
+  // history to serve while the venue REST is unreachable.
+  void klines.flush();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useState, type RefObject } from "react";
-import type { IChartApi, ISeriesApi, MouseEventParams, SeriesType, Time } from "lightweight-charts";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import type { IChartApi, ISeriesApi, SeriesType, Time } from "lightweight-charts";
 import { useChartStore, selectDrawings } from "@/lib/store/chartStore";
 import {
-  FIB_LEVELS, drawingForTool, isPlacementTool, pointsRequired, positionMetrics,
+  FIB_LEVELS, PALETTE, TOOL_BY_ID, TYPE_LABEL, drawingForTool, isPlacementTool,
+  pointsRequired, positionMetrics, toolHint,
 } from "@/lib/utils/drawings";
 import { fmtPrice } from "@/lib/utils/format";
+import { EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
 import type { ChartTool, Drawing, DrawingPoint } from "@/lib/types";
 
 interface Props {
@@ -21,29 +23,55 @@ type Drag =
   | { kind: "body"; id: string; start: DrawingPoint[]; anchor: DrawingPoint }
   | { kind: "point"; id: string; index: number };
 
+/** Presses closer than this are one click, not a rubber-band drag. */
+const DRAG_SLOP = 4;
+/** Anchors closer than this build a shape with nothing to see or grab. */
+const MIN_ANCHOR_GAP = 4;
+
 /**
- * SVG overlay for user drawings. Shapes are rendered through the chart's own
- * coordinate transforms (timeToCoordinate / priceToCoordinate) so they stay
- * glued to the candles while panning and zooming.
+ * Chart annotations: the SVG shapes, the pointer input that places and edits
+ * them, and the floating controls around the selected one.
  *
- * Drawings belong to a symbol; with the cursor tool active they can be clicked
- * to select, then dragged (whole shape or individual anchors), locked or
- * deleted. Nothing here touches orders — these are chart annotations only.
+ * Geometry is projected through the chart's own transforms (timeToCoordinate /
+ * priceToCoordinate) so shapes stay glued to the candles while panning.
+ *
+ * Input is split by mode, which is what keeps drawing from fighting the chart:
+ *  - a placement tool armed → this layer captures every pointer event, so the
+ *    chart cannot pan underneath a rubber-band drag (the crosshair is replayed
+ *    into the chart with setCrosshairPosition so it still looks alive);
+ *  - cursor tool → the layer is transparent to the pointer except on the shapes
+ *    themselves, so pan/zoom stay normal and a click on empty chart deselects.
+ *
+ * Nothing here touches orders — these are chart annotations only.
  */
 export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
+  const layerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const drawings = useChartStore((s) => selectDrawings(s, symbol));
   const showDrawings = useChartStore((s) => s.settings.showDrawings);
   const activeTool = useChartStore((s) => s.activeTool);
+  const stickyTool = useChartStore((s) => s.stickyTool);
   const selectedId = useChartStore((s) => s.selectedId);
+  const setActiveTool = useChartStore((s) => s.setActiveTool);
+  const setStickyTool = useChartStore((s) => s.setStickyTool);
   const [tick, setTick] = useState(0);
+  /** Shape under the pointer — highlighted so clickable geometry is findable. */
+  const [hoverId, setHoverId] = useState<string | null>(null);
+  /** Right-click menu on a shape: the action bar needs a selection first, and
+   *  hunting for a thin line to click is exactly the friction this removes. */
+  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
 
   const pendingRef = useRef<DrawingPoint[]>([]);
   const cursorRef = useRef<DrawingPoint | null>(null);
+  /** Pointer in layer pixels, for the label that follows the cursor. */
+  const posRef = useRef<{ x: number; y: number } | null>(null);
   const dragRef = useRef<Drag | null>(null);
   const pressRef = useRef<{ x: number; y: number; pt: DrawingPoint } | null>(null);
-  /** True while the first anchor of the current shape came from an active press. */
+  /** True while the first anchor of the current shape came from this press. */
   const anchoredRef = useRef(false);
+
+  const placing = isPlacementTool(activeTool);
+  const need = pointsRequired(activeTool);
 
   // Half-finished shapes never survive a tool or symbol change.
   useEffect(() => {
@@ -52,176 +80,185 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
     dragRef.current = null;
     pressRef.current = null;
     anchoredRef.current = false;
+    setMenu(null);
+    setHoverId(null);
+    clearCrosshair(chartRef, mainRef);
     setTick((t) => t + 1);
-  }, [activeTool, symbol]);
+  }, [activeTool, symbol, chartRef, mainRef]);
 
-  useEffect(() => {
-    const cancel = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      pendingRef.current = [];
-      cursorRef.current = null;
-      pressRef.current = null;
-      anchoredRef.current = false;
-      setTick((t) => t + 1);
-    };
-    window.addEventListener("keydown", cancel);
-    return () => window.removeEventListener("keydown", cancel);
+  // Redraw requests arrive per mouse-move/pan event; coalescing them to one
+  // frame keeps the SVG overlay from re-rendering several times per frame.
+  const bump = useCallback(() => {
+    requestAnimationFrame(() => setTick((t) => t + 1));
   }, []);
 
-  // Chart event wiring (re-bound after the chart instance is recreated).
+  // The chart is re-created on theme/type changes; the overlay must follow.
   useEffect(() => {
     const chart = chartRef.current;
-    // Only the chart is guaranteed to exist when this (child) effect runs; the
-    // main series ref is assigned by the parent's data effect, which runs
-    // *after* this one. So bind on the chart alone and resolve the series
-    // lazily inside each callback — otherwise click placement never binds.
     if (!chart) return;
-
-    // Redraw requests arrive per mouse-move/pan event; coalescing them to one
-    // frame keeps the SVG overlay from re-rendering several times per frame.
-    let raf = 0;
-    const bump = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        setTick((t) => t + 1);
-      });
-    };
-    const state = useChartStore.getState;
-
-    const pointOf = (p: MouseEventParams<Time>): DrawingPoint | null => {
-      const main = mainRef.current;
-      if (!main || !p.point || typeof p.time !== "number") return null;
-      const price = main.coordinateToPrice(p.point.y);
-      if (price == null) return null;
-      return { time: p.time, price: Number(price) };
-    };
-
-    const onCrosshair = (p: MouseEventParams<Time>) => {
-      if (!isPlacementTool(state().activeTool)) { cursorRef.current = null; return; }
-      cursorRef.current = pointOf(p);
-      bump();
-    };
-
-    const plotPointAt = (clientX: number, clientY: number): DrawingPoint | null => {
-      const main = mainRef.current;
-      const svg = svgRef.current;
-      if (!main || !svg) return null;
-      const rect = svg.getBoundingClientRect();
-      const x = clientX - rect.left;
-      const y = clientY - rect.top;
-      // A click on the price axis still resolves to a (clamped) time, so bound
-      // the horizontal side to the plot ourselves.
-      if (x < 0 || y < 0 || x > chart.timeScale().width()) return null;
-      const time = chart.timeScale().coordinateToTime(x);
-      const price = main.coordinateToPrice(y);
-      if (typeof time !== "number" || price == null) return null;
-      return { time, price: Number(price) };
-    };
-
-    /** Screen distance between two anchors; null (off-scale) counts as far apart. */
-    const distance = (a: DrawingPoint, b: DrawingPoint): number => {
-      const main = mainRef.current;
-      if (!main) return Infinity;
-      const ax = chart.timeScale().timeToCoordinate(a.time as Time);
-      const ay = main.priceToCoordinate(a.price);
-      const bx = chart.timeScale().timeToCoordinate(b.time as Time);
-      const by = main.priceToCoordinate(b.price);
-      if (ax == null || ay == null || bx == null || by == null) return Infinity;
-      return Math.hypot(ax - bx, ay - by);
-    };
-
-    /**
-     * Append one anchor, completing (and persisting) the shape once the tool
-     * has all of its points. Anchors closer than a few pixels are dropped:
-     * they would build a zero-length shape that renders nothing and therefore
-     * cannot be selected or removed.
-     */
-    const addPoint = (pt: DrawingPoint, tool: ChartTool) => {
-      const pending = pendingRef.current;
-      const last = pending[pending.length - 1];
-      if (last && distance(last, pt) < 4) return;
-      pending.push(pt);
-      const need = pointsRequired(tool);
-      if (pending.length < need) { bump(); return; }
-      const d = drawingForTool(symbol, tool, pending.slice(0, need));
-      pendingRef.current = [];
-      cursorRef.current = null;
-      anchoredRef.current = false;
-      if (d) state().addDrawing(symbol, d);
-      // Staying on the tool (like TradingView) would strand partial shapes;
-      // drop back to the cursor so a stray click cannot start a new one.
-      state().setActiveTool("crosshair");
-      bump();
-    };
-
-    /*
-     * Anchors come from raw mouse events, not chart.subscribeClick: that
-     * delegate suppresses any second press within 500ms of the first
-     * (double-click detection), which silently drops an anchor and leaves a
-     * stale half-shape behind that a later click then completes in the wrong
-     * place.
-     *
-     * Two gestures are supported: click-click (one anchor per press/release
-     * pair) and press-drag-release, where multi-point tools anchor on press so
-     * the rubber-band preview follows the drag and the release point closes it.
-     */
-    const onDown = (e: MouseEvent) => {
-      pressRef.current = null;
-      anchoredRef.current = false;
-      if (e.button !== 0 || isUiControl(e.target)) return;
-      const tool = state().activeTool;
-      if (!isPlacementTool(tool)) return;
-      const pt = plotPointAt(e.clientX, e.clientY);
-      if (!pt) return;
-      pressRef.current = { x: e.clientX, y: e.clientY, pt };
-      if (pointsRequired(tool) >= 2 && pendingRef.current.length === 0) {
-        pendingRef.current = [pt];
-        anchoredRef.current = true;
-        bump();
-      }
-    };
-
-    const onUp = (e: MouseEvent) => {
-      const press = pressRef.current;
-      pressRef.current = null;
-      if (!press || e.button !== 0 || isUiControl(e.target)) return;
-      const tool = state().activeTool;
-      if (!isPlacementTool(tool)) { anchoredRef.current = false; return; }
-      const moved = Math.abs(e.clientX - press.x) > 4 || Math.abs(e.clientY - press.y) > 4;
-      if (moved) {
-        // Only a press that anchored a shape may close it on release;
-        // otherwise the gesture was a pan.
-        if (anchoredRef.current) addPoint(plotPointAt(e.clientX, e.clientY) ?? press.pt, tool);
-        anchoredRef.current = false;
-        return;
-      }
-      anchoredRef.current = false;
-      // Click-click: the press anchor is already pending, so this adds the
-      // next point (and is rejected as degenerate if it is the same one).
-      addPoint(press.pt, tool);
-    };
-
     const ts = chart.timeScale();
     ts.subscribeVisibleLogicalRangeChange(bump);
-    chart.subscribeCrosshairMove(onCrosshair);
-    window.addEventListener("mousedown", onDown, true);
-    window.addEventListener("mouseup", onUp, true);
-
-    const ro = new ResizeObserver(bump);
-    if (svgRef.current?.parentElement) ro.observe(svgRef.current.parentElement);
-
+    window.addEventListener("resize", bump);
     return () => {
-      if (raf) cancelAnimationFrame(raf);
       ts.unsubscribeVisibleLogicalRangeChange(bump);
-      chart.unsubscribeCrosshairMove(onCrosshair);
-      window.removeEventListener("mousedown", onDown, true);
-      window.removeEventListener("mouseup", onUp, true);
-      ro.disconnect();
+      window.removeEventListener("resize", bump);
     };
-  }, [chartRef, mainRef, symbol, epoch]);
+  }, [chartRef, bump, epoch]);
 
-  // ── Drag editing ────────────────────────────────────────────────────
+  // A press-and-release on empty chart (the canvas, not a shape or a control)
+  // drops the selection, so the action bar never floats over nothing. A drag is
+  // a pan and keeps the selection. This deliberately does not use
+  // chart.subscribeClick: that delegate suppresses rapid repeat clicks, which is
+  // exactly the input a drawing gesture makes.
+  useEffect(() => {
+    let x = 0;
+    let y = 0;
+    const onDown = (e: MouseEvent) => {
+      x = e.clientX;
+      y = e.clientY;
+    };
+    const onUp = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      if (Math.abs(e.clientX - x) > DRAG_SLOP || Math.abs(e.clientY - y) > DRAG_SLOP) return;
+      const t = e.target;
+      if (!(t instanceof Element) || t.tagName.toLowerCase() !== "canvas") return;
+      const st = useChartStore.getState();
+      if (st.activeTool === "crosshair" && st.selectedId) st.selectDrawing(null);
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const pointAt = useCallback((clientX: number, clientY: number): DrawingPoint | null => {
+    const chart = chartRef.current;
+    const main = mainRef.current;
+    const layer = layerRef.current;
+    if (!chart || !main || !layer) return null;
+    const r = layer.getBoundingClientRect();
+    const x = clientX - r.left;
+    const y = clientY - r.top;
+    // The price axis is part of the widget but not of the plot: a press there
+    // would otherwise clamp to the last visible bar.
+    if (x < 0 || y < 0 || x > chart.timeScale().width() || y > r.height) return null;
+    const time = chart.timeScale().coordinateToTime(x);
+    const price = main.coordinateToPrice(y);
+    if (typeof time !== "number" || price == null) return null;
+    return { time, price: Number(price) };
+  }, [chartRef, mainRef]);
+
+  /** Screen distance between two anchors; null (off-scale) counts as far apart. */
+  const distance = (a: DrawingPoint, b: DrawingPoint): number => {
+    const chart = chartRef.current;
+    const main = mainRef.current;
+    if (!chart || !main) return Infinity;
+    const ax = chart.timeScale().timeToCoordinate(a.time as Time);
+    const ay = main.priceToCoordinate(a.price);
+    const bx = chart.timeScale().timeToCoordinate(b.time as Time);
+    const by = main.priceToCoordinate(b.price);
+    if (ax == null || ay == null || bx == null || by == null) return Infinity;
+    return Math.hypot(ax - bx, ay - by);
+  };
+
+  /**
+   * Append one anchor, completing (and persisting) the shape once the tool has
+   * all of its points.
+   *
+   * TradingView's rhythm on completion: the tool returns to the cursor and the
+   * finished shape is selected, so the next click adjusts it instead of drawing
+   * another one. "Keep armed" (the flyout, or the strip below) opts out.
+   */
+  const addPoint = (pt: DrawingPoint, tool: ChartTool) => {
+    const pending = pendingRef.current;
+    const last = pending[pending.length - 1];
+    if (last && distance(last, pt) < MIN_ANCHOR_GAP) return;
+    pending.push(pt);
+    if (pending.length < pointsRequired(tool)) { bump(); return; }
+    const d = drawingForTool(symbol, tool, pending.slice(0, pointsRequired(tool)));
+    pendingRef.current = [];
+    cursorRef.current = null;
+    anchoredRef.current = false;
+    if (d) {
+      const st = useChartStore.getState();
+      if (!st.stickyTool) st.setActiveTool("crosshair");
+      // Runs after the tool switch: setActiveTool clears the selection, so the
+      // order is what leaves the new shape with its handles showing.
+      st.addDrawing(symbol, d);
+    }
+    bump();
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    // The floating controls are children of the layer: a press on one of them
+    // must not place an anchor.
+    if (e.target instanceof Element && e.target.closest("[data-draw-ui]")) return;
+    pressRef.current = null;
+    anchoredRef.current = false;
+    if (e.button !== 0) return;
+    const pt = pointAt(e.clientX, e.clientY);
+    if (!pt) return;
+    pressRef.current = { x: e.clientX, y: e.clientY, pt };
+    // Multi-point tools anchor on press so the preview follows the drag and the
+    // release point closes the shape.
+    if (need >= 2 && pendingRef.current.length === 0) {
+      pendingRef.current = [pt];
+      anchoredRef.current = true;
+    }
+    // Capture so a release outside the plot still closes the shape. Synthetic
+    // pointer ids are not always active, which makes this throw.
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch { /* no capture: the release may land on the chart instead */ }
+    bump();
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const layer = layerRef.current;
+    const r = layer?.getBoundingClientRect();
+    posRef.current = r ? { x: e.clientX - r.left, y: e.clientY - r.top } : null;
+    cursorRef.current = pointAt(e.clientX, e.clientY);
+    setCrosshair(chartRef, mainRef, cursorRef.current);
+    bump();
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const press = pressRef.current;
+    pressRef.current = null;
+    if (!press || e.button !== 0) return;
+    const moved = Math.abs(e.clientX - press.x) > DRAG_SLOP || Math.abs(e.clientY - press.y) > DRAG_SLOP;
+    if (moved) {
+      // Only a press that anchored a shape may close it on release.
+      if (anchoredRef.current) addPoint(pointAt(e.clientX, e.clientY) ?? press.pt, activeTool);
+    } else {
+      // Click-click: the press anchor is already pending, so this adds the next
+      // point (and is rejected as degenerate if it is the same one).
+      addPoint(press.pt, activeTool);
+    }
+    anchoredRef.current = false;
+  };
+
+  const onPointerLeave = () => {
+    pressRef.current = null;
+    cursorRef.current = null;
+    posRef.current = null;
+    setCrosshair(chartRef, mainRef, null);
+    bump();
+  };
+
+  /** Right-click abandons the shape in progress, like TradingView. */
+  const onContextMenu = (e: React.MouseEvent) => {
+    if (!placing) return;
+    e.preventDefault();
+    pendingRef.current = [];
+    anchoredRef.current = false;
+    pressRef.current = null;
+    bump();
+  };
+
+  // ── Drag editing (cursor tool) ───────────────────────────────────────
   // Applied per move (not on an animation frame): a frame callback can be
   // skipped entirely, which would silently drop the drag. The expensive part —
   // writing the drawing blob to localStorage — is debounced inside the store.
@@ -230,11 +267,11 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
       const drag = dragRef.current;
       const chart = chartRef.current;
       const main = mainRef.current;
-      const svg = svgRef.current;
-      if (!drag || !chart || !main || !svg) return;
-      const rect = svg.getBoundingClientRect();
-      const t = chart.timeScale().coordinateToTime(e.clientX - rect.left);
-      const price = main.coordinateToPrice(e.clientY - rect.top);
+      const layer = layerRef.current;
+      if (!drag || !chart || !main || !layer) return;
+      const r = layer.getBoundingClientRect();
+      const t = chart.timeScale().coordinateToTime(e.clientX - r.left);
+      const price = main.coordinateToPrice(e.clientY - r.top);
       if (typeof t !== "number" || price == null) return;
       const state = useChartStore.getState();
       const cur = selectDrawings(state, symbol).find((d) => d.id === drag.id);
@@ -290,7 +327,7 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
     st.selectDrawing(d.id);
     if (d.locked) return;
     st.beginDrawingHistory(symbol);
-    const anchor = anchorOf(e, chartRef, mainRef, svgRef);
+    const anchor = anchorOf(e, chartRef, mainRef, layerRef);
     if (!anchor) return;
     dragRef.current = { kind: "body", id: d.id, start: d.points.map((p) => ({ ...p })), anchor };
   };
@@ -303,44 +340,200 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
     dragRef.current = { kind: "point", id: d.id, index };
   };
 
+  const openMenu = (d: Drawing, e: React.MouseEvent) => {
+    if (!interactive) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const layer = layerRef.current;
+    if (!layer) return;
+    useChartStore.getState().selectDrawing(d.id);
+    const r = layer.getBoundingClientRect();
+    setMenu({
+      id: d.id,
+      x: Math.max(4, Math.min(e.clientX - r.left, r.width - 150)),
+      y: Math.max(4, Math.min(e.clientY - r.top, r.height - 110)),
+    });
+  };
+
+  /** One geometry bundle per shape; `ghost` marks the in-progress preview,
+   *  which paints like the finished shape but takes no input. */
+  const geomFor = (d: Drawing, ghost = false): Geom => ({
+    symbol, xOf, yOf, W, H, ghost,
+    selected: !ghost && d.id === selectedId,
+    hovered: !ghost && d.id === hoverId,
+    interactive: interactive && !ghost,
+    onBody: (e) => startBodyDrag(d, e),
+    onHandle: (i, e) => startPointDrag(d, i, e),
+    onContext: (e) => openMenu(d, e),
+    onHover: () => setHoverId(d.id),
+    onLeave: () => setHoverId((cur) => (cur === d.id ? null : cur)),
+  });
+
   if (chart && main && showDrawings && W > 0 && H > 0) {
-    for (const d of drawings) {
-      nodes.push(renderDrawing(d, {
-        symbol, xOf, yOf, W, H,
-        selected: d.id === selectedId,
-        interactive,
-        onBody: (e) => startBodyDrag(d, e),
-        onHandle: (i, e) => startPointDrag(d, i, e),
-      }));
+    for (const d of drawings) nodes.push(renderDrawing(d, geomFor(d)));
+    const ghost = ghostDrawing(pendingRef.current, cursorRef.current, activeTool, symbol);
+    if (ghost) {
+      nodes.push(
+        <g key="ghost" opacity={0.6} style={{ pointerEvents: "none" }}>
+          {renderDrawing(ghost, geomFor(ghost, true))}
+        </g>,
+      );
     }
-    const preview = previewNodes(pendingRef.current.concat(cursorRef.current ?? []), activeTool, xOf, yOf, W, H);
-    if (preview) nodes.push(preview);
+    // Every click must leave a mark: the first anchor of a 3-click tool paints
+    // nothing on its own (the bands need all three points), so it shows as a dot.
+    const dots: React.ReactNode[] = [];
+    pendingRef.current.forEach((p, i) => {
+      const x = xOf(p.time);
+      const y = yOf(p.price);
+      if (x == null || y == null) return;
+      dots.push(<circle key={`pa-${i}`} cx={x} cy={y} r={3.5} fill="var(--bg-elevated)" stroke="var(--accent)" strokeWidth={1.5} />);
+    });
+    if (dots.length > 0) nodes.push(<g key="pending" pointerEvents="none">{dots}</g>);
   }
 
   const selected = drawings.find((d) => d.id === selectedId);
   const actions = selected && showDrawings
-    ? actionBar(selected, svgRef, xOf, yOf)
+    ? actionBar(selected, layerRef, xOf, yOf)
     : null;
+  const menuDrawing = menu ? drawings.find((d) => d.id === menu.id) : null;
 
   // `tick` participates only as a redraw trigger for the imperative transforms.
+  const drafting = pendingRef.current.length;
+  const pos = posRef.current;
   return (
-    <>
-      <svg
-        ref={svgRef}
-        data-tick={tick}
-        className="pointer-events-none absolute inset-0 z-10 h-full w-full"
-        style={{ cursor: isPlacementTool(activeTool) ? "crosshair" : "default" }}
-      >
+    <div
+      ref={layerRef}
+      data-draw-layer=""
+      className="absolute inset-0 z-10"
+      style={{ pointerEvents: placing ? "auto" : "none", cursor: placing ? "crosshair" : "default", touchAction: "none" }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerLeave={onPointerLeave}
+      onContextMenu={onContextMenu}
+    >
+      <svg ref={svgRef} data-tick={tick} className="pointer-events-none absolute inset-0 h-full w-full">
         {nodes}
       </svg>
+
+      {/* The instruction rides next to the pointer, where the user is looking. */}
+      {placing && pos && (
+        <div
+          className="cursor-label glass-card"
+          style={{
+            left: Math.max(8, Math.min(pos.x + 16, W - 230)),
+            top: Math.max(8, Math.min(pos.y + 18, H - 46)),
+          }}
+        >
+          <span style={{ color: "var(--accent)" }}>{TOOL_BY_ID[activeTool].label}</span>
+          <span style={{ color: "var(--text-muted)" }}>{toolHint(activeTool, drafting)}</span>
+        </div>
+      )}
+
+      {/* Status strip: what is armed, how far along it is, and the two controls
+          that used to live in a toolbar pill the scrolling bar clipped away. */}
+      {placing && (
+        <div className="armed-strip glass-card" data-draw-ui>
+          <span className="pulse-dot h-1.5 w-1.5 rounded-full" style={{ background: "var(--accent)" }} />
+          <span style={{ color: "var(--accent)" }}>{TOOL_BY_ID[activeTool].label}</span>
+          <span style={{ color: "var(--text-muted)" }}>{toolHint(activeTool, drafting)}</span>
+          <span className="flex items-center gap-0.5" aria-hidden="true">
+            {Array.from({ length: need }, (_, i) => (
+              <span
+                key={i}
+                className="h-1.5 w-1.5 rounded-full"
+                style={{ background: i < drafting ? "var(--accent)" : "color-mix(in srgb, var(--text-muted) 45%, transparent)" }}
+              />
+            ))}
+          </span>
+          <button
+            onClick={() => setStickyTool(!stickyTool)}
+            data-active={stickyTool}
+            title={stickyTool ? "Stops after this shape and returns to the cursor" : "Keep this tool armed to draw shape after shape"}
+          >
+            {stickyTool ? "keep armed" : "once"}
+          </button>
+          <button onClick={() => setActiveTool("crosshair")} title="Back to the cursor (Esc)">Esc</button>
+        </div>
+      )}
+
       {actions}
-    </>
+      {menu && menuDrawing && (
+        <ContextMenu d={menuDrawing} symbol={symbol} at={menu} onClose={() => setMenu(null)} />
+      )}
+    </div>
   );
 }
 
-/** Presses on a control (the action bar, toolbar) must never place an anchor. */
-function isUiControl(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest("button,a,input,select") !== null;
+/**
+ * Replay the pointer position into the chart's own crosshair. The overlay
+ * swallows mouse events while a tool is armed, so without this the dashed
+ * lines and the axis price/time labels would vanish mid-drawing.
+ */
+function setCrosshair(
+  chartRef: RefObject<IChartApi | null>,
+  mainRef: RefObject<ISeriesApi<SeriesType> | null>,
+  pt: DrawingPoint | null,
+) {
+  const chart = chartRef.current;
+  const main = mainRef.current;
+  if (!chart || !main) return;
+  try {
+    if (pt) chart.setCrosshairPosition(pt.price, pt.time as Time, main);
+    else chart.clearCrosshairPosition();
+  } catch { /* series detached between frames */ }
+}
+
+function clearCrosshair(
+  chartRef: RefObject<IChartApi | null>,
+  mainRef: RefObject<ISeriesApi<SeriesType> | null>,
+) {
+  setCrosshair(chartRef, mainRef, null);
+}
+
+/**
+ * The shape that *would* be created if the next click landed here. Built with
+ * the same factory as a real drawing and painted by the same renderer, so a
+ * preview can never disagree with the result: the fib levels, the position
+ * bands and the measure label all show up while you are still aiming.
+ */
+function ghostDrawing(
+  pending: DrawingPoint[],
+  cursor: DrawingPoint | null,
+  tool: ChartTool,
+  symbol: string,
+): Drawing | null {
+  if (!cursor || !isPlacementTool(tool)) return null;
+  return drawingForTool(symbol, tool, pending.length > 0 ? [...pending, cursor] : [cursor]);
+}
+
+/** Right-click shortcuts on a shape. The floating action bar needs the shape to
+ *  be selected first, which is fiddly on a thin line — this opens wherever the
+ *  pointer already is. */
+function ContextMenu({
+  d, symbol, at, onClose,
+}: { d: Drawing; symbol: string; at: { x: number; y: number }; onClose: () => void }) {
+  const st = useChartStore.getState();
+  const hidden = d.visible === false;
+  const item = "ctx-item";
+  const run = (fn: () => void) => () => { fn(); onClose(); };
+  return (
+    <div className="glass-card ctx-menu" data-draw-ui style={{ left: at.x, top: at.y }}>
+      <div className="ctx-title">{TYPE_LABEL[d.type]}</div>
+      <button className={item} onClick={run(() => st.updateDrawing(symbol, d.id, { locked: !d.locked }))}>
+        {d.locked ? <LockIcon size={13} /> : <UnlockIcon size={13} />}
+        {d.locked ? "Unlock" : "Lock"}
+      </button>
+      <button className={item} onClick={run(() => st.updateDrawing(symbol, d.id, { visible: hidden }))}>
+        {hidden ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
+        {hidden ? "Show" : "Hide"}
+      </button>
+      <button className={item} style={{ color: "var(--danger)" }} onClick={run(() => st.removeDrawing(symbol, d.id))}>
+        <TrashIcon size={13} />
+        Delete
+      </button>
+    </div>
+  );
 }
 
 /** Screen point -> chart coordinates. Both axes have to resolve, so a press
@@ -349,54 +542,83 @@ function anchorOf(
   e: React.MouseEvent,
   chartRef: RefObject<IChartApi | null>,
   mainRef: RefObject<ISeriesApi<SeriesType> | null>,
-  svgRef: RefObject<SVGSVGElement | null>,
+  layerRef: RefObject<HTMLDivElement | null>,
 ): DrawingPoint | null {
   const chart = chartRef.current;
   const main = mainRef.current;
-  const svg = svgRef.current;
-  if (!chart || !main || !svg) return null;
-  const rect = svg.getBoundingClientRect();
+  const layer = layerRef.current;
+  if (!chart || !main || !layer) return null;
+  const rect = layer.getBoundingClientRect();
   const t = chart.timeScale().coordinateToTime(e.clientX - rect.left);
   const price = main.coordinateToPrice(e.clientY - rect.top);
   if (typeof t !== "number" || price == null) return null;
   return { time: t, price: Number(price) };
 }
 
-/** Small floating control strip next to the selected shape. */
+/** Floating control card next to the selected shape: colour, lock, hide, delete.
+ *  It stays out of the way of the drawing itself and only appears once a shape
+ *  is selected, so the chart never loses space when nothing is being edited. */
 function actionBar(
   d: Drawing,
-  svgRef: RefObject<SVGSVGElement | null>,
+  layerRef: RefObject<HTMLDivElement | null>,
   xOf: (t: number) => number | null,
   yOf: (p: number) => number | null,
 ) {
-  const el = svgRef.current;
+  const el = layerRef.current;
   if (!el) return null;
   const xs = d.points.map((p) => xOf(p.time)).filter((v): v is number => v != null);
   const ys = d.points.map((p) => yOf(p.price)).filter((v): v is number => v != null);
-  const x = xs.length ? Math.max(4, Math.min(Math.min(...xs), el.clientWidth - 96)) : 8;
-  const y = ys.length ? Math.max(4, Math.min(...ys) - 30) : 8;
+  const CARD_W = 6 + PALETTE.length * 18 + 3 * 26 + 12;
+  const x = xs.length ? Math.max(4, Math.min(Math.min(...xs), el.clientWidth - CARD_W - 4)) : 8;
+  const y = ys.length ? Math.max(4, Math.min(...ys) - 38) : 8;
   const st = useChartStore.getState();
-  const btn = "pointer-events-auto flex h-6 w-6 items-center justify-center rounded text-[12px]";
-  const style = { background: "var(--bg-elevated)", border: "1px solid var(--border-strong)", color: "var(--text-secondary)" };
+  const btn = "flex h-6 w-6 items-center justify-center rounded-md";
+  const btnStyle = (active: boolean) => ({
+    color: active ? "var(--accent)" : "var(--text-secondary)",
+    background: active ? "color-mix(in srgb, var(--accent) 16%, transparent)" : "transparent",
+  });
   return (
-    <div className="absolute z-20 flex gap-1" style={{ left: x, top: y }}>
+    <div className="glass-card absolute z-20 flex items-center gap-1 px-1.5 py-1" data-draw-ui style={{ left: x, top: y }}>
+      {PALETTE.map((c) => (
+        <button
+          key={c}
+          className="h-3.5 w-3.5 rounded-full"
+          style={{
+            background: c,
+            boxShadow: d.color === c ? "0 0 0 1.5px var(--bg-elevated), 0 0 0 3px var(--accent)" : "none",
+          }}
+          title={`Colour ${c}`}
+          aria-label={`Set drawing colour ${c}`}
+          onClick={() => st.updateDrawing(d.symbol, d.id, { color: c })}
+        />
+      ))}
+      <span className="mx-0.5 h-4 w-px" style={{ background: "var(--border-strong)" }} />
       <button
         className={btn}
-        style={style}
+        style={btnStyle(!!d.locked)}
         title={d.locked ? "Unlock drawing" : "Lock drawing"}
         aria-label={d.locked ? "Unlock drawing" : "Lock drawing"}
         onClick={() => st.updateDrawing(d.symbol, d.id, { locked: !d.locked })}
       >
-        {d.locked ? "🔒" : "🔓"}
+        {d.locked ? <LockIcon size={14} /> : <UnlockIcon size={14} />}
       </button>
       <button
         className={btn}
-        style={style}
-        title="Delete drawing"
+        style={btnStyle(d.visible === false)}
+        title={d.visible === false ? "Show drawing" : "Hide drawing"}
+        aria-label={d.visible === false ? "Show drawing" : "Hide drawing"}
+        onClick={() => st.updateDrawing(d.symbol, d.id, { visible: d.visible === false })}
+      >
+        {d.visible === false ? <EyeOffIcon size={14} /> : <EyeIcon size={14} />}
+      </button>
+      <button
+        className={btn}
+        style={{ color: "var(--danger)" }}
+        title="Delete drawing (Del)"
         aria-label="Delete drawing"
         onClick={() => st.removeDrawing(d.symbol, d.id)}
       >
-        ✕
+        <TrashIcon size={14} />
       </button>
     </div>
   );
@@ -408,10 +630,16 @@ interface Geom {
   yOf: (p: number) => number | null;
   W: number;
   H: number;
+  /** The in-progress preview: paints like a shape, takes no input. */
+  ghost: boolean;
   selected: boolean;
+  hovered: boolean;
   interactive: boolean;
   onBody: (e: React.MouseEvent) => void;
   onHandle: (index: number, e: React.MouseEvent) => void;
+  onContext: (e: React.MouseEvent) => void;
+  onHover: () => void;
+  onLeave: () => void;
 }
 
 /**
@@ -421,14 +649,35 @@ interface Geom {
  */
 function hitProps(g: Geom, d: Drawing) {
   return {
+    "data-drawing": d.id,
     stroke: "transparent",
-    strokeWidth: 12,
+    strokeWidth: g.hovered ? 16 : 12,
     fill: "none",
     style: {
       pointerEvents: g.interactive ? ("stroke" as const) : ("none" as const),
-      cursor: d.locked ? "default" : "move",
+      cursor: d.locked ? "pointer" : "move",
     },
     onMouseDown: g.onBody,
+    onContextMenu: g.onContext,
+    onMouseEnter: g.onHover,
+    onMouseLeave: g.onLeave,
+  };
+}
+
+/** Same affordances as `hitProps` for the filled shapes (fib box, position
+ *  bands), where the grabbable area is the fill rather than a stroke. */
+function fillProps(g: Geom, d: Drawing) {
+  return {
+    "data-drawing": d.id,
+    stroke: "transparent",
+    style: {
+      pointerEvents: g.interactive ? ("fill" as const) : ("none" as const),
+      cursor: d.locked ? "pointer" : "move",
+    },
+    onMouseDown: g.onBody,
+    onContextMenu: g.onContext,
+    onMouseEnter: g.onHover,
+    onMouseLeave: g.onLeave,
   };
 }
 
@@ -446,14 +695,16 @@ function Handles({ g, d }: { g: Geom; d: Drawing }) {
         return (
           <circle
             key={`h-${i}`}
+            data-drawing={d.id}
             cx={x}
             cy={y}
-            r={4}
+            r={g.hovered ? 5 : 4}
             fill="var(--bg-elevated)"
             stroke="var(--accent)"
             strokeWidth={1.5}
             style={{ pointerEvents: "all", cursor: "grab" }}
             onMouseDown={(e) => g.onHandle(i, e)}
+            onContextMenu={g.onContext}
           />
         );
       })}
@@ -467,7 +718,7 @@ function renderDrawing(d: Drawing, g: Geom): React.ReactNode {
   if (d.visible === false) return null;
   const [p1, p2, p3] = d.points;
   if (!p1) return null;
-  const width = g.selected ? 2 : 1.5;
+  const width = g.selected ? 2.25 : g.hovered ? 2 : 1.5;
   const key = d.id;
 
   if (d.type === "horizontal") {
@@ -543,9 +794,8 @@ function renderDrawing(d: Drawing, g: Geom): React.ReactNode {
         {rows.length > 0 && (
           <rect
             x={left} y={topY} width={right - left} height={Math.max(bottomY - topY, 8)}
-            fill={d.color} fillOpacity={0.07} stroke="transparent"
-            style={{ pointerEvents: g.interactive ? "fill" : "none", cursor: d.locked ? "default" : "move" }}
-            onMouseDown={g.onBody}
+            fill={d.color} fillOpacity={g.hovered ? 0.12 : 0.07}
+            {...fillProps(g, d)}
           />
         )}
         {rows.map((r) => (
@@ -579,13 +829,9 @@ function renderDrawing(d: Drawing, g: Geom): React.ReactNode {
     return (
       <g key={key}>
         <rect x={left} y={Math.min(yEntry, yTarget)} width={right - left} height={Math.abs(yTarget - yEntry)}
-          fill={profitFill} fillOpacity={0.16} stroke="transparent"
-          style={{ pointerEvents: g.interactive ? "fill" : "none", cursor: d.locked ? "default" : "move" }}
-          onMouseDown={g.onBody} />
+          fill={profitFill} fillOpacity={g.hovered ? 0.22 : 0.16} {...fillProps(g, d)} />
         <rect x={left} y={Math.min(yEntry, yStop)} width={right - left} height={Math.abs(yStop - yEntry)}
-          fill={lossFill} fillOpacity={0.16} stroke="transparent"
-          style={{ pointerEvents: g.interactive ? "fill" : "none", cursor: d.locked ? "default" : "move" }}
-          onMouseDown={g.onBody} />
+          fill={lossFill} fillOpacity={g.hovered ? 0.22 : 0.16} {...fillProps(g, d)} />
         {[{ y: yEntry, c: "var(--text-primary)" }, { y: yTarget, c: profitFill }, { y: yStop, c: lossFill }].map((l, i) => (
           <line key={i} x1={left} y1={l.y} x2={right} y2={l.y} stroke={l.c} strokeWidth={i === 0 ? width : 1} pointerEvents="none" />
         ))}
@@ -622,32 +868,6 @@ function measureLabel(d: Drawing, g: Geom, x: number, y: number) {
     <g pointerEvents="none">
       <rect x={x - 78} y={y - 20} width={156} height={15} rx={3} fill="var(--bg-elevated)" stroke="var(--border-strong)" />
       <text x={x} y={y - 9} fontSize={10} textAnchor="middle" fill={diff >= 0 ? "var(--success)" : "var(--danger)"}>{label}</text>
-    </g>
-  );
-}
-
-/** Dashed in-progress shape while a placement tool collects clicks. */
-function previewNodes(
-  points: DrawingPoint[],
-  tool: ChartTool,
-  xOf: (t: number) => number | null,
-  yOf: (p: number) => number | null,
-  W: number,
-  H: number,
-): React.ReactNode {
-  if (!isPlacementTool(tool) || points.length < 2) return null;
-  const a = points[points.length - 2]!, b = points[points.length - 1]!;
-  const x1 = xOf(a.time), y1 = yOf(a.price), x2 = xOf(b.time), y2 = yOf(b.price);
-  if (x1 == null || y1 == null || x2 == null || y2 == null) return null;
-  const end = tool === "trendline" || tool === "ray" || tool === "measure"
-    ? { x: x2, y: y2 }
-    : tool === "horizontal"
-      ? { x: W, y: y1 }
-      : { x: x1, y: H };
-  return (
-    <g key="preview" pointerEvents="none">
-      <line x1={x1} y1={y1} x2={end.x} y2={end.y} stroke="var(--accent)" strokeWidth={1.5} strokeDasharray="5 4" opacity={0.85} />
-      <circle cx={x1} cy={y1} r={3} fill="var(--accent)" />
     </g>
   );
 }
