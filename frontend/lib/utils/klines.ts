@@ -126,10 +126,18 @@ function sameValues(a: KlineData, b: KlineData): boolean {
 }
 
 /**
+ * Decide which of two versions of the *same* candle wins. Called for every
+ * collision of a bulk merge; returning true keeps the candle already on hand.
+ * The store uses it so a REST snapshot taken before the newest live tick cannot
+ * paint over that tick — the chart's forming bar would otherwise jump backwards.
+ */
+export type CandlePrecedence = (stored: KlineData, incoming: KlineData) => boolean;
+
+/**
  * Insert one kline keeping the array sorted. Returns the SAME reference when
  * nothing changes so zustand subscribers don't re-render needlessly.
  */
-function mergeOne(base: KlineData[], k: KlineData): KlineData[] {
+function mergeOne(base: KlineData[], k: KlineData, protect?: CandlePrecedence): KlineData[] {
   let lo = 0;
   let hi = base.length;
   while (lo < hi) {
@@ -139,6 +147,7 @@ function mergeOne(base: KlineData[], k: KlineData): KlineData[] {
   }
   if (lo < base.length && base[lo]!.openTime === k.openTime) {
     if (sameValues(base[lo]!, k)) return base;
+    if (protect?.(base[lo]!, k)) return base;
     const next = base.slice();
     next[lo] = k;
     return next;
@@ -148,19 +157,86 @@ function mergeOne(base: KlineData[], k: KlineData): KlineData[] {
   return next.length > MAX_KLINES ? next.slice(next.length - MAX_KLINES) : next;
 }
 
+/** Collapse repeated timestamps inside one batch, keeping the later row: within
+ *  a single source the last write is the newer view. `normalizeKlines` already
+ *  does this for anything that comes from the wire, and the linear merge below
+ *  assumes unique keys, so a caller that hands over a raw batch is normalised
+ *  here rather than silently keeping two candles for one timestamp. */
+function dedupeBatch(list: KlineData[]): KlineData[] {
+  let dup = false;
+  for (let i = 1; i < list.length; i++) {
+    if (list[i]!.openTime === list[i - 1]!.openTime) { dup = true; break; }
+  }
+  if (!dup) return list;
+  const out: KlineData[] = [list[0]!];
+  for (let i = 1; i < list.length; i++) {
+    const k = list[i]!;
+    if (k.openTime === out[out.length - 1]!.openTime) out[out.length - 1] = k;
+    else out.push(k);
+  }
+  return out;
+}
+
+/**
+ * Merge two ascending, de-duplicated arrays in one pass with one new array.
+ * This is the bulk path: a page used to go through `mergeOne` per candle, and
+ * each of those copied the whole window — a 1000-candle page into a 5000-candle
+ * window moved six million entries to keep a thousand of them.
+ *
+ * On a timestamp collision the incoming candle wins unless `protect` says the
+ * stored one is newer. Returns `base` itself when nothing actually changed.
+ */
+function mergeSorted(base: KlineData[], incomingRaw: KlineData[], protect?: CandlePrecedence): KlineData[] {
+  const incoming = dedupeBatch(incomingRaw);
+  if (incoming.length === 0) return base;
+  if (base.length === 0) return capKlines(incoming);
+
+  const out: KlineData[] = [];
+  let i = 0;
+  let j = 0;
+  let changed = false;
+  while (i < base.length && j < incoming.length) {
+    const b = base[i]!;
+    const n = incoming[j]!;
+    if (b.openTime < n.openTime) {
+      out.push(b);
+      i++;
+    } else if (b.openTime > n.openTime) {
+      out.push(n);
+      j++;
+      changed = true;
+    } else {
+      if (sameValues(b, n)) out.push(b);
+      else {
+        const keep = protect?.(b, n) ?? false;
+        out.push(keep ? b : n);
+        changed = changed || !keep;
+      }
+      i++;
+      j++;
+    }
+  }
+  while (i < base.length) out.push(base[i++]!);
+  while (j < incoming.length) {
+    out.push(incoming[j++]!);
+    changed = true;
+  }
+  if (!changed) return base;
+  return out.length > MAX_KLINES ? out.slice(out.length - MAX_KLINES) : out;
+}
+
 /**
  * Sorted, de-duplicating merge of `incoming` into `base`.
  * Handles out-of-order arrivals (WS replay after reconnect, REST overlapping
  * live data, backfill) and returns `base` unchanged when there is nothing new.
  */
-export function mergeKlines(base: KlineData[], incoming: KlineData | KlineData[]): KlineData[] {
-  const list = Array.isArray(incoming) ? incoming : [incoming];
-  let cur = base;
-  for (const item of list) {
-    if (!item) continue;
-    cur = mergeOne(cur, item);
-  }
-  return cur;
+export function mergeKlines(
+  base: KlineData[],
+  incoming: KlineData | KlineData[],
+  protect?: CandlePrecedence,
+): KlineData[] {
+  if (Array.isArray(incoming)) return mergeSorted(base, incoming, protect);
+  return incoming ? mergeOne(base, incoming, protect) : base;
 }
 
 /** Raw incoming kline (WS or REST row) merged into an existing array. */

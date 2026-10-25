@@ -1,4 +1,4 @@
-import { useMarketStore } from "@/lib/store/marketStore";
+import { useMarketStore, klineTickCursor } from "@/lib/store/marketStore";
 import {
   EMPTY_KLINES, MAX_KLINES, TIMEFRAME_SPAN_MS, klineKey, normalizeKlines,
 } from "@/lib/utils/klines";
@@ -18,8 +18,15 @@ const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ||
   (typeof window !== "undefined" ? `http://${window.location.hostname}:8080` : "http://localhost:8080");
 
-const HISTORICAL_LIMIT = 500;
-const BACKFILL_LIMIT = 500;
+/** Bybit serves at most 1000 candles per page, and so does the gateway. */
+const HISTORICAL_LIMIT = 1000;
+const BACKFILL_LIMIT = 1000;
+/** A freshly opened chart is primed to roughly this many candles, so the first
+ *  screen shows real history instead of the ~3 weeks a single 1h page covers.
+ *  It is a *first screen* target, not the history depth: the gateway keeps the
+ *  policy depth (see `meta.history.target`) and answers a scroll from its mirror
+ *  without the browser having to ask for it in advance. */
+const HISTORY_TARGET = 2000;
 /** After a failed page, let the user scroll a bit before probing again. */
 const BACKFILL_RETRY_MS = 5000;
 /** Ceiling on one /api/klines round trip. The gateway bounds its own upstream
@@ -32,6 +39,8 @@ const inFlightHistorical = new Set<string>();
 const inFlightBackfill = new Set<string>();
 const backfillRetryAt = new Map<string, number>();
 const backfillExhausted = new Set<string>();
+/** Windows already widened once to HISTORY_TARGET this session. */
+const primed = new Set<string>();
 const historyRetry = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** While the venue is unreachable the terminal keeps probing on a decaying
@@ -47,23 +56,57 @@ function clearHistoryRetry(key: string) {
 /** The single call site for /api/klines. Throws on any failure — HTTP status,
  *  a gateway `error` body, a non-array payload, or the timeout — so callers can
  *  read a throw as "retry/abort" and an empty array as genuine "no more
- *  history". */
+ *  history".
+ *
+ *  `meta` is the gateway's own statement about the page it just answered:
+ *  `venueBacked` — real exchange history, not the websocket tail (the two are
+ *  the same length, so the chart cannot tell them apart from the candles);
+ *  `canGoOlder` — an older page behind this one can actually be fetched right
+ *  now; `source` — whether the page is the venue's answer or our mirror's, which
+ *  is what decides if a short page means the end of history. Absent meta means an
+ *  older gateway: take the page as the venue's own. */
 async function fetchKlineBatch(
   symbol: string,
   interval: Timeframe | string,
   limit: number,
   endTime?: number,
-): Promise<KlineData[]> {
+): Promise<{
+  candles: KlineData[];
+  venueBacked: boolean;
+  canGoOlder: boolean;
+  fromVenue: boolean;
+  /** The gateway's own crawl state for this window: how deep the policy wants it,
+   *  how deep it is, and what history says. `status === "exhausted"` is the
+   *  exchange ending the range — the one end-of-history signal a client may
+   *  trust. Absent on an older gateway. */
+  history?: { target: number; bars: number; status: string };
+}> {
   const params = new URLSearchParams({ symbol, interval: String(interval), limit: String(limit) });
   if (endTime !== undefined) params.set("endTime", String(endTime));
   const res = await fetch(`${API_BASE}/api/klines?${params.toString()}`, {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`klines HTTP ${res.status}`);
-  const json = (await res.json()) as { data?: unknown; error?: string };
+  const json = (await res.json()) as {
+    data?: unknown;
+    error?: string;
+    meta?: {
+      venueBacked?: unknown; canGoOlder?: unknown; source?: unknown;
+      history?: { target?: unknown; bars?: unknown; status?: unknown };
+    };
+  };
   if (json.error) throw new Error(String(json.error));
   if (!Array.isArray(json.data)) throw new Error("malformed klines response");
-  return normalizeKlines(json.data, String(interval));
+  const h = json.meta?.history;
+  return {
+    candles: normalizeKlines(json.data, String(interval)),
+    venueBacked: json.meta?.venueBacked === true,
+    canGoOlder: json.meta?.canGoOlder === true,
+    fromVenue: json.meta?.source !== "mirror",
+    history: Number.isFinite(h?.target) && Number.isFinite(h?.bars) && typeof h?.status === "string"
+      ? { target: Number(h.target), bars: Number(h.bars), status: h.status }
+      : undefined,
+  };
 }
 
 /**
@@ -89,13 +132,18 @@ export async function loadHistoricalKlines(
     // One request per attempt: the gateway already re-probes the venue and
     // answers from its own cache, so an immediate second round trip here would
     // only double the time the user stares at a spinner.
-    const batch = await fetchKlineBatch(symbol, interval, limit);
+    const cursor = klineTickCursor();
+    const page = await fetchKlineBatch(symbol, interval, limit);
     clearHistoryRetry(key);
-    // A fresh window may have older data behind it.
+    // A fresh window may have older data behind it after all: the previous page
+    // ending short was this session's inference, not a fact about the exchange.
     backfillExhausted.delete(key);
     backfillRetryAt.delete(key);
-    useMarketStore.getState().mergeKlinesInto(symbol, interval, batch);
+    // The page is a snapshot of the venue as of `cursor`: the store keeps any
+    // candle the stream touched after that instead of painting over it.
+    useMarketStore.getState().mergeKlinesInto(symbol, interval, page.candles, cursor);
     useMarketStore.getState().setKlineStatus(symbol, interval, "ready");
+    primeOlder(symbol, interval, page, page.candles.length >= limit);
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -110,6 +158,36 @@ export async function loadHistoricalKlines(
   } finally {
     inFlightHistorical.delete(key);
   }
+}
+
+/** Widen a window the client has just landed, once per (symbol, interval): one
+ *  page is what the chart asked for, the second is what makes the first screen
+ *  show real history. It runs only when all three hold: the candles on hand fall
+ *  short of the target, the gateway says that page is exchange history, and it
+ *  says an older page can actually be fetched right now. A stream-fed mirror
+ *  window is just as long but has nothing behind it, and while the venue refuses
+ *  the window the follow-up only buys another refusal.
+ *
+ *  The fourth condition is M5b's: when the gateway's mirror already holds the
+ *  first screen's depth, the client asks for nothing. The crawl is what gathers
+ *  that depth, a scroll-back is answered from the mirror in about a millisecond,
+ *  and a second page here would only be a duplicate of work already done. */
+function primeOlder(
+  symbol: string,
+  interval: Timeframe | string,
+  page: { candles: KlineData[]; venueBacked: boolean; canGoOlder: boolean; history?: { bars: number } },
+  fullPage: boolean,
+) {
+  const key = klineKey(symbol, interval);
+  if (primed.has(key) || backfillExhausted.has(key)) return;
+  const have = useMarketStore.getState().klines[symbol]?.[interval]?.length ?? 0;
+  if (have >= HISTORY_TARGET || (page.history?.bars ?? 0) >= HISTORY_TARGET) {
+    primed.add(key);
+    return;
+  }
+  if (!fullPage || !page.venueBacked || !page.canGoOlder) return;
+  primed.add(key);
+  void loadOlderKlines(symbol, interval, Math.min(BACKFILL_LIMIT, HISTORY_TARGET - have));
 }
 
 /** How far behind the present a window may fall before it counts as frozen.
@@ -171,7 +249,9 @@ export async function loadOlderKlines(symbol: string, interval: Timeframe | stri
 
   const budget = MAX_KLINES - existing.length;
   if (budget <= 0) {
-    backfillExhausted.add(key);
+    // The browser is full, the exchange is not: scrolling further would push the
+    // live tail out of the series. Re-checked on every scroll rather than stored,
+    // so a window that has room again is never left looking like ended history.
     return false;
   }
 
@@ -181,16 +261,32 @@ export async function loadOlderKlines(symbol: string, interval: Timeframe | stri
   try {
     // `end` is inclusive upstream, so asking for one ms before the oldest bar
     // keeps the boundary candle out of the page instead of wasting a slot.
-    const batch = await fetchKlineBatch(symbol, interval, wanted, oldestOpenTime - 1);
+    const cursor = klineTickCursor();
+    const page = await fetchKlineBatch(symbol, interval, wanted, oldestOpenTime - 1);
+    const batch = page.candles;
+    // The gateway's own history state outranks anything inferred from a page
+    // length: `exhausted` is the exchange ending the range, whatever the number
+    // of candles on this page happens to look like.
+    const ended = page.history?.status === "exhausted";
+    if (ended) backfillExhausted.add(key);
     const older = batch.filter((k) => k.openTime < oldestOpenTime);
     if (older.length === 0) {
-      backfillExhausted.add(key);
+      // Only the venue can end a window. An empty mirror page would mean nothing
+      // older than this in what we hold, which is a depth question, not history.
+      if (ended || page.fromVenue) backfillExhausted.add(key);
+      else backfillRetryAt.set(key, Date.now() + BACKFILL_RETRY_MS);
       return false;
     }
-    useMarketStore.getState().mergeKlinesInto(symbol, interval, older);
-    // A partial page means the exchange has nothing older for this window.
-    if (batch.length < wanted) backfillExhausted.add(key);
-    else backfillExhausted.delete(key);
+    useMarketStore.getState().mergeKlinesInto(symbol, interval, older, cursor);
+    // A venue page shorter than asked is the exchange saying it has nothing
+    // older. A mirror page shorter than asked is only how deep our mirror goes,
+    // so the window stays open for a later scroll instead of being closed off.
+    if (ended || batch.length < wanted) {
+      if (page.fromVenue) backfillExhausted.add(key);
+      else backfillRetryAt.set(key, Date.now() + BACKFILL_RETRY_MS);
+    } else {
+      backfillExhausted.delete(key);
+    }
     return true;
   } catch {
     // Only a failed page is throttled. A successful one is followed up

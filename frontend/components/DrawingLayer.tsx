@@ -7,13 +7,16 @@ import {
   FIB_LEVELS, PALETTE, TOOL_BY_ID, TYPE_LABEL, drawingForTool, isPlacementTool,
   pointsRequired, positionMetrics, toolHint,
 } from "@/lib/utils/drawings";
-import { fmtPrice } from "@/lib/utils/format";
+import { fmtPrice, fmtTime } from "@/lib/utils/format";
 import { EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
 import type { ChartTool, Drawing, DrawingPoint } from "@/lib/types";
 
 interface Props {
   chartRef: RefObject<IChartApi | null>;
   mainRef: RefObject<ISeriesApi<SeriesType> | null>;
+  /** The element lightweight-charts was created inside — wheel events have to be
+   *  sent back to it (see the wheel-forwarding effect). */
+  hostRef: RefObject<HTMLDivElement | null>;
   symbol: string;
   /** Bumped whenever the chart instance is recreated. */
   epoch: number;
@@ -44,7 +47,7 @@ const MIN_ANCHOR_GAP = 4;
  *
  * Nothing here touches orders — these are chart annotations only.
  */
-export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
+export function DrawingLayer({ chartRef, mainRef, hostRef, symbol, epoch }: Props) {
   const layerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const drawings = useChartStore((s) => selectDrawings(s, symbol));
@@ -60,6 +63,10 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
   /** Right-click menu on a shape: the action bar needs a selection first, and
    *  hunting for a thin line to click is exactly the friction this removes. */
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  /** Space held: the layer lets the pointer through so the chart can be panned
+   *  without disarming the tool — drawing across a wider window than one screen
+   *  is otherwise impossible. */
+  const [hand, setHand] = useState(false);
 
   const pendingRef = useRef<DrawingPoint[]>([]);
   const cursorRef = useRef<DrawingPoint | null>(null);
@@ -82,6 +89,7 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
     anchoredRef.current = false;
     setMenu(null);
     setHoverId(null);
+    setHand(false);
     clearCrosshair(chartRef, mainRef);
     setTick((t) => t + 1);
   }, [activeTool, symbol, chartRef, mainRef]);
@@ -138,17 +146,55 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
     const main = mainRef.current;
     const layer = layerRef.current;
     if (!chart || !main || !layer) return null;
-    const r = layer.getBoundingClientRect();
-    const x = clientX - r.left;
-    const y = clientY - r.top;
-    // The price axis is part of the widget but not of the plot: a press there
-    // would otherwise clamp to the last visible bar.
-    if (x < 0 || y < 0 || x > chart.timeScale().width() || y > r.height) return null;
-    const time = chart.timeScale().coordinateToTime(x);
-    const price = main.coordinateToPrice(y);
-    if (typeof time !== "number" || price == null) return null;
-    return { time, price: Number(price) };
+    return plotPoint(chart, main, layer.getBoundingClientRect(), clientX, clientY);
   }, [chartRef, mainRef]);
+
+  // The overlay sits *beside* the chart's own DOM, so while a tool is armed the
+  // wheel never reaches lightweight-charts and the chart cannot be zoomed
+  // mid-drawing. Hand the event to whatever the overlay is covering instead.
+  useEffect(() => {
+    const layer = layerRef.current;
+    const host = hostRef.current;
+    if (!layer || !host || !placing) return;
+    const onWheel = (e: WheelEvent) => {
+      const was = layer.style.pointerEvents;
+      layer.style.pointerEvents = "none";
+      const under = document.elementFromPoint(e.clientX, e.clientY);
+      layer.style.pointerEvents = was;
+      if (!under || !host.contains(under)) return;
+      under.dispatchEvent(new WheelEvent("wheel", {
+        deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ, deltaMode: e.deltaMode,
+        clientX: e.clientX, clientY: e.clientY, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey,
+        altKey: e.altKey, metaKey: e.metaKey, bubbles: true, cancelable: true,
+      }));
+      e.preventDefault();
+    };
+    layer.addEventListener("wheel", onWheel, { passive: false });
+    return () => layer.removeEventListener("wheel", onWheel);
+  }, [placing, hostRef]);
+
+  // Space = hand tool, but only while a drawing tool is armed (otherwise the
+  // global shortcut handler and the browser's own space behaviour rule).
+  useEffect(() => {
+    if (!placing) return;
+    const isField = (t: EventTarget | null) =>
+      t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || isField(e.target)) return;
+      e.preventDefault();
+      if (e.type === "keydown") { if (!e.repeat) setHand(true); }
+      else setHand(false);
+    };
+    const onBlur = () => setHand(false);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKey);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKey);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [placing]);
 
   /** Screen distance between two anchors; null (off-scale) counts as far apart. */
   const distance = (a: DrawingPoint, b: DrawingPoint): number => {
@@ -269,10 +315,8 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
       const main = mainRef.current;
       const layer = layerRef.current;
       if (!drag || !chart || !main || !layer) return;
-      const r = layer.getBoundingClientRect();
-      const t = chart.timeScale().coordinateToTime(e.clientX - r.left);
-      const price = main.coordinateToPrice(e.clientY - r.top);
-      if (typeof t !== "number" || price == null) return;
+      const pt = plotPoint(chart, main, layer.getBoundingClientRect(), e.clientX, e.clientY);
+      if (!pt) return;
       const state = useChartStore.getState();
       const cur = selectDrawings(state, symbol).find((d) => d.id === drag.id);
       if (!cur || cur.locked) return;
@@ -280,16 +324,16 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
       if (drag.kind === "point") {
         const next = cur.points.map((p, i) => {
           if (i !== drag.index) return p;
-          if (cur.type === "horizontal") return { ...p, price: Number(price) };
-          if (cur.type === "vertical") return { ...p, time: t };
-          return { time: t, price: Number(price) };
+          if (cur.type === "horizontal") return { ...p, price: pt.price };
+          if (cur.type === "vertical") return { ...p, time: pt.time };
+          return { time: pt.time, price: pt.price };
         });
         state.updateDrawingPoints(symbol, drag.id, next);
         return;
       }
 
-      const dx = t - drag.anchor.time;
-      const dy = Number(price) - drag.anchor.price;
+      const dx = pt.time - drag.anchor.time;
+      const dy = pt.price - drag.anchor.price;
       const next = drag.start.map((p) => {
         if (cur.type === "horizontal") return { ...p, price: p.price + dy };
         if (cur.type === "vertical") return { ...p, time: p.time + dx };
@@ -327,7 +371,9 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
     st.selectDrawing(d.id);
     if (d.locked) return;
     st.beginDrawingHistory(symbol);
-    const anchor = anchorOf(e, chartRef, mainRef, layerRef);
+    const layer = layerRef.current;
+    if (!chart || !main || !layer) return;
+    const anchor = plotPoint(chart, main, layer.getBoundingClientRect(), e.clientX, e.clientY);
     if (!anchor) return;
     dragRef.current = { kind: "body", id: d.id, start: d.points.map((p) => ({ ...p })), anchor };
   };
@@ -400,12 +446,17 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
   // `tick` participates only as a redraw trigger for the imperative transforms.
   const drafting = pendingRef.current.length;
   const pos = posRef.current;
+  const aim = cursorRef.current;
   return (
     <div
       ref={layerRef}
       data-draw-layer=""
       className="absolute inset-0 z-10"
-      style={{ pointerEvents: placing ? "auto" : "none", cursor: placing ? "crosshair" : "default", touchAction: "none" }}
+      style={{
+        pointerEvents: placing && !hand ? "auto" : "none",
+        cursor: hand ? "grab" : placing ? "crosshair" : "default",
+        touchAction: "none",
+      }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -416,17 +467,23 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
         {nodes}
       </svg>
 
-      {/* The instruction rides next to the pointer, where the user is looking. */}
+      {/* The instruction rides next to the pointer, where the user is looking,
+          and carries the value the next click would anchor at. */}
       {placing && pos && (
         <div
           className="cursor-label glass-card"
           style={{
-            left: Math.max(8, Math.min(pos.x + 16, W - 230)),
+            left: Math.max(8, Math.min(pos.x + 16, W - 330)),
             top: Math.max(8, Math.min(pos.y + 18, H - 46)),
           }}
         >
           <span style={{ color: "var(--accent)" }}>{TOOL_BY_ID[activeTool].label}</span>
           <span style={{ color: "var(--text-muted)" }}>{toolHint(activeTool, drafting)}</span>
+          {aim && (
+            <span className="tabular-nums" style={{ color: "var(--text-primary)" }}>
+              {fmtPrice(aim.price, symbol)} · {fmtTime(aim.time * 1000)}
+            </span>
+          )}
         </div>
       )}
 
@@ -454,6 +511,13 @@ export function DrawingLayer({ chartRef, mainRef, symbol, epoch }: Props) {
             {stickyTool ? "keep armed" : "once"}
           </button>
           <button onClick={() => setActiveTool("crosshair")} title="Back to the cursor (Esc)">Esc</button>
+          <span
+            className="px-0.5"
+            style={{ color: "var(--text-muted)" }}
+            title="Hold Space to pan and zoom the chart without dropping the tool"
+          >
+            Space = pan
+          </span>
         </div>
       )}
 
@@ -536,23 +600,29 @@ function ContextMenu({
   );
 }
 
-/** Screen point -> chart coordinates. Both axes have to resolve, so a press
- *  over an axis area (outside the scales) places nothing. */
-function anchorOf(
-  e: React.MouseEvent,
-  chartRef: RefObject<IChartApi | null>,
-  mainRef: RefObject<ISeriesApi<SeriesType> | null>,
-  layerRef: RefObject<HTMLDivElement | null>,
+/**
+ * Screen point -> chart coordinates, kept inside the plot. The price axis and
+ * the time axis are part of the widget but not part of the drawable area, and
+ * the bottom price-scale margin extrapolates *below* zero — a BTC line at
+ * −4,636 is an invisible drawing the user can only find again in the panel.
+ */
+function plotPoint(
+  chart: IChartApi,
+  main: ISeriesApi<SeriesType>,
+  rect: DOMRect,
+  clientX: number,
+  clientY: number,
 ): DrawingPoint | null {
-  const chart = chartRef.current;
-  const main = mainRef.current;
-  const layer = layerRef.current;
-  if (!chart || !main || !layer) return null;
-  const rect = layer.getBoundingClientRect();
-  const t = chart.timeScale().coordinateToTime(e.clientX - rect.left);
-  const price = main.coordinateToPrice(e.clientY - rect.top);
-  if (typeof t !== "number" || price == null) return null;
-  return { time: t, price: Number(price) };
+  const ts = chart.timeScale();
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  if (x < 0 || y < 0 || x > ts.width() || y > rect.height - ts.height()) return null;
+  const time = ts.coordinateToTime(x);
+  if (typeof time !== "number") return null;
+  const zeroY = main.priceToCoordinate(0);
+  const price = main.coordinateToPrice(zeroY != null ? Math.min(y, zeroY - 2) : y);
+  if (price == null) return null;
+  return { time, price: Number(price) };
 }
 
 /** Floating control card next to the selected shape: colour, lock, hide, delete.

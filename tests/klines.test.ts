@@ -141,6 +141,29 @@ test("mergeKlines drops duplicates across sources", () => {
   assert.equal(next[0]!.close, "103", "later source wins");
 });
 
+test("mergeKlines keeps the stored candle when precedence says so", () => {
+  // The REST-vs-live case: the candle on hand came from the stream, the page is
+  // an older snapshot of the same bar.
+  const stored = { ...norm(100, "105"), closed: false };
+  const snapshot = { ...norm(100, "90"), closed: false };
+  const next = mergeKlines([stored], [snapshot], (a, b) => a.closed === b.closed);
+  assert.equal(next[0]!.close, "105", "the protected candle survives");
+  assert.equal(next[0]!, stored, "and keeps its identity, so nothing re-renders");
+  // With no protection the same page overwrites it — which is the bug.
+  assert.equal(mergeKlines([stored], [snapshot])[0]!.close, "90");
+});
+
+test("mergeKlines: the linear bulk path agrees with the per-candle path", () => {
+  const base = Array.from({ length: 400 }, (_, i) => norm(i));
+  const page = Array.from({ length: 250 }, (_, i) => norm(300 + i, "120"));
+  let stepwise = base;
+  for (const k of page) stepwise = mergeKlines(stepwise, k);
+  const bulk = mergeKlines(base, page);
+  assert.deepEqual(bulk.map((k) => [k.openTime, k.close]), stepwise.map((k) => [k.openTime, k.close]));
+  assert.equal(bulk.length, 550, "overlapping page adds only the older rows");
+  assert.ok(ascending(bulk));
+});
+
 test("mergeKlines caps the merged window", () => {
   const base = Array.from({ length: MAX_KLINES }, (_, i) => norm(i));
   const next = mergeKlines(base, norm(MAX_KLINES));

@@ -45,7 +45,7 @@ function isOscillator(t: IndicatorConfig["type"]) {
 }
 
 export function ChartPanel({ symbol }: { symbol: string }) {
-  const ref = useRef<HTMLDivElement>(null);
+  const chartHostRef = useRef<HTMLDivElement>(null);
   const chRef = useRef<IChartApi | null>(null);
   const csRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const vsRef = useRef<ISeriesApi<"Histogram"> | null>(null);
@@ -88,7 +88,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
 
   // ── Chart lifecycle (created once; theme is applied as options) ──────
   useEffect(() => {
-    const el = ref.current;
+    const el = chartHostRef.current;
     if (!el) return;
     const c = getTc(theme);
     const ch = createChart(el, {
@@ -491,8 +491,8 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     <div className="relative h-full w-full">
       <CrossInfo />
       <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} connected={connected} onRetry={retry} />
-      <div ref={ref} className="h-full w-full" />
-      <DrawingLayer chartRef={chRef} mainRef={mainRef} symbol={symbol} epoch={chartEpoch} />
+      <div ref={chartHostRef} className="h-full w-full" />
+      <DrawingLayer chartRef={chRef} mainRef={mainRef} hostRef={chartHostRef} symbol={symbol} epoch={chartEpoch} />
       <DrawingsPanel symbol={symbol} />
     </div>
   );

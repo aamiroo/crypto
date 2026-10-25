@@ -45,7 +45,7 @@ const collector = new BybitCollector(log);
 // The last candle windows the venue served, so a REST outage or a restart does
 // not leave the terminal without history.
 const klines = await createKlinesStore({ logger: log }).load();
-const { server } = createGateway(instruments, ["bybit"], log, collector, klines);
+const { server, klineCrawler } = createGateway(instruments, ["bybit"], log, collector, klines);
 
 // Bybit's spot ticker stream only pushes for pairs that trade, so seed the
 // Hub's "latest" cache from REST and keep refreshing quiet pairs.
@@ -63,14 +63,27 @@ server.listen(port, () => {
 
 /** Order matters: stop producing (ticker seed, collector sockets) before the
  *  gateway closes, otherwise a bus event would hit a dead client set. */
-function shutdown() {
+let closing = false;
+async function shutdown() {
+  // A second signal means the first is stuck behind a disk that will not answer:
+  // the mirror stays debounced, so whatever reached disk is what survives.
+  if (closing) process.exit(1);
+  closing = true;
   stopTickerSeed();
   collector.close();
+  // Cancels the crawl's pending pages; a page already in flight still merges,
+  // because throwing away fetched history would be the worse loss.
+  klineCrawler.stop();
   server.close();
-  // The candle-window mirror is debounced; flush it so a restart still has
-  // history to serve while the venue REST is unreachable.
-  void klines.flush();
+  // Window writes are debounced, and the crawl cursor is what a restart resumes
+  // from — exiting before they land would lose both. Bounded, so a wedged disk
+  // cannot turn a SIGTERM into a hung process.
+  try {
+    await Promise.race([klines.flush(), new Promise((r) => setTimeout(r, 2000))]);
+  } catch (err) {
+    log.warn("klines flush failed on shutdown", { err: err.message });
+  }
   process.exit(0);
 }
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());

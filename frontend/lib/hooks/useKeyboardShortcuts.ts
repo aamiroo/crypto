@@ -106,6 +106,7 @@ export const SHORTCUTS: ShortcutDef[] = [
   { keys: "Ctrl/⌘ Z", label: "Undo drawing" },
   { keys: "Ctrl/⌘ Y", label: "Redo drawing" },
   { keys: "Tool key again", label: "Keep the tool armed for repeated drawing" },
+  { keys: "Space (tool armed)", label: "Pan and zoom without dropping the tool" },
   { keys: "Right-click a drawing", label: "Lock / hide / delete menu" },
   { keys: "Del", label: "Delete selected drawing" },
   { keys: "Esc", label: "Cancel tool / close dialog" },

@@ -4,6 +4,7 @@ import type {
   SymbolsData, TickerData, TradeData,
 } from "@/lib/types";
 import { EMPTY_KLINES, MAX_KLINES, klineKey, mergeKlines, mergeRawKline } from "@/lib/utils/klines";
+import type { CandlePrecedence } from "@/lib/utils/klines";
 import { setInstruments } from "@/lib/utils/symbol";
 
 /** Orderbook stored as maps for O(1) delta apply */
@@ -27,13 +28,39 @@ interface MarketState {
   setSymbol: (s: string) => void;
   setConnected: (c: boolean) => void;
   setKlineStatus: (symbol: string, interval: string, state: KlineState, error?: string) => void;
-  mergeKlinesInto: (symbol: string, interval: string, incoming: KlineData[]) => void;
+  mergeKlinesInto: (symbol: string, interval: string, incoming: KlineData[], restTickCursor?: number) => void;
   applyEnvelope: (env: Envelope) => void;
 }
 
 const MAX_TRADES = 100;
 const TICKER_BATCH_MS = 250;
 const MESSAGE_TS_STEP_MS = 1000;
+
+/** Per window: the newest candle the websocket wrote, and which tick wrote it.
+ *  Kept outside the store — it is bookkeeping for merge precedence, not
+ *  something a component renders, and a per-tick `set()` for it would notify
+ *  subscribers twice. */
+const liveTick = new Map<string, { openTime: number; seq: number }>();
+/** Counts live candles as they are applied. A REST page is tagged with the count
+ *  read when the request was issued, so "newer" is an exact ordering instead of a
+ *  millisecond clock comparison — two events in the same millisecond would
+ *  otherwise decide the winner by luck. */
+let tickSeq = 0;
+export function klineTickCursor(): number { return tickSeq; }
+
+/** Which version of a colliding candle wins when a REST page lands on top of
+ *  live data. A REST page is a snapshot of the venue taken when the request was
+ *  issued, so it cannot know about a tick that arrived after that: for the candle
+ *  the stream touched, the stream version is the truth. A finalized bar also
+ *  beats the same bar as "still forming", which is what the page carries when the
+ *  bar closed in the meantime. Without this the chart's last candle jumps
+ *  backwards every time a slow page resolves over a fast stream. */
+function restPrecedence(key: string, issuedAtCursor: number): CandlePrecedence {
+  const live = liveTick.get(key);
+  return (stored, incoming) =>
+    (stored.closed && !incoming.closed) ||
+    (!!live && live.openTime === stored.openTime && live.seq > issuedAtCursor);
+}
 
 /** Only a plausible exchange pair is trusted from the cache: a garbage symbol
  *  makes every subscribe and REST call fail, which looks like a dead terminal. */
@@ -60,12 +87,15 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   setKlineStatus: (symbol, interval, state, error) =>
     set((st) => ({ klineStatus: { ...st.klineStatus, [klineKey(symbol, interval)]: { state, error } } })),
 
-  mergeKlinesInto: (symbol, interval, incoming) =>
+  mergeKlinesInto: (symbol, interval, incoming, restTickCursor) =>
     set((st) => {
       if (incoming.length === 0) return {};
       const byIv = st.klines[symbol] ?? {};
       const cur = byIv[interval] ?? EMPTY_KLINES;
-      const next = mergeKlines(cur, incoming);
+      // Only a REST page carries the precedence question; a bulk merge from the
+      // stream (replay after a reconnect) is the newer source and simply wins.
+      const next = mergeKlines(cur, incoming,
+        restTickCursor === undefined ? undefined : restPrecedence(klineKey(symbol, interval), restTickCursor));
       if (next === cur) return {};
       return { klines: { ...st.klines, [symbol]: { ...byIv, [interval]: next } } };
     }),
@@ -119,6 +149,12 @@ export const useMarketStore = create<MarketState>((set, get) => ({
       case "kline": {
         const raw = env.data as KlineData;
         const interval = raw?.interval || "1m";
+        const tickTime = Number(raw?.openTime);
+        // Counted even when the frame changes nothing: it is still the stream
+        // saying it owns this candle, which is what a later REST page defers to.
+        if (Number.isFinite(tickTime) && tickTime > 0) {
+          liveTick.set(klineKey(sym, interval), { openTime: tickTime, seq: ++tickSeq });
+        }
         set((st) => {
           const byIv = st.klines[sym] ?? {};
           const cur = byIv[interval] ?? EMPTY_KLINES;

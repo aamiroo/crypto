@@ -140,7 +140,15 @@ function installFetch() {
   };
 }
 
-const okBatch = (data: unknown[]): StubResponse => ({ ok: true, body: { data } });
+/** A page the venue really served, with an older page fetchable behind it. Only
+ *  then is the window worth widening. */
+const okBatch = (data: unknown[]): StubResponse => ({ ok: true, body: { data, meta: { venueBacked: true, canGoOlder: true } } });
+/** The same candles answered from a stream-fed mirror window — real bars, but no
+ *  exchange history behind them. */
+const mirrorBatch = (data: unknown[]): StubResponse => ({ ok: true, body: { data, meta: { venueBacked: false, canGoOlder: true } } });
+/** Venue history the gateway cannot go deeper on right now (its window is in the
+ *  cool-off a refusal put it in). */
+const blockedOlderBatch = (data: unknown[]): StubResponse => ({ ok: true, body: { data, meta: { venueBacked: true, canGoOlder: false } } });
 
 beforeEach(() => {
   installFetch();
@@ -160,8 +168,83 @@ test("loadHistoricalKlines: loading -> ready and populates sorted data", async (
   assert.equal(ks.length, 3);
   assert.ok(ascending(ks));
   assert.equal(fetchCalls.length, 1);
-  assert.ok(fetchCalls[0]!.includes("limit=500"));
+  assert.ok(fetchCalls[0]!.includes("limit=1000"), "opens with the largest page the gateway serves");
   assert.ok(!fetchCalls[0]!.includes("endTime"), "initial load needs no endTime");
+});
+
+test("loadHistoricalKlines: a full opening page is widened once", async () => {
+  const sym = "H1b";
+  const page = (oldest: number) => okBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (oldest + i) * MIN)));
+  let pages = 0;
+  fetchResponder = () => { pages++; return page(pages === 1 ? 20_000 : 10_000); };
+
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 2, "a full page says there is more behind it, so it is followed up");
+  assert.ok(fetchCalls[1]!.includes("endTime="), "the follow-up asks for the older page");
+
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(getKlines(sym).length, 2000, "both pages landed in order");
+  const before = fetchCalls.length;
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, before + 1, "widening is once per window, not per refresh");
+});
+
+test("prime: a stream-fed mirror page is the same length but is not widened", async () => {
+  const sym = "H1c";
+  // 1000 candles, so by count alone this looks exactly like an exchange page —
+  // and the old code spent a doomed second round trip on it.
+  const full = Array.from({ length: 1000 }, (_, i) => raw(BASE + (20_000 + i) * MIN));
+  fetchResponder = () => mirrorBatch(full);
+
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(getKlines(sym).length, 1000);
+  assert.equal(fetchCalls.length, 1, "the gateway said this window has no venue history behind it");
+  assert.ok(!fetchCalls[0]!.includes("endTime"), "so no older page is requested");
+});
+
+test("prime: a window that already reaches the target is not widened", async () => {
+  const sym = "H1d";
+  seedWindow(sym, 20_000, 2000);
+  fetchResponder = () => okBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (21_000 + i) * MIN)));
+
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 1, "2000 candles on hand is already the history target");
+});
+
+test("prime: a window the venue refuses right now is not followed up", async () => {
+  const sym = "H1f";
+  // Real history, so a deeper page would be meaningful — but the gateway just
+  // said it cannot fetch one. Asking anyway is the request this stage removes.
+  fetchResponder = () => blockedOlderBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (20_000 + i) * MIN)));
+
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(getKlines(sym).length, 1000);
+  assert.equal(fetchCalls.length, 1, "the gateway said no older page is reachable");
+  assert.ok(!fetchCalls[0]!.includes("endTime"));
+
+  // The refusal is temporary state, not a property of the window: the widening
+  // still happens once the gateway can fetch again.
+  fetchResponder = (url) => (url.includes("endTime")
+    ? okBatch(Array.from({ length: 5 }, (_, i) => raw(BASE + (19_995 + i) * MIN)))
+    : blockedOlderBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (20_000 + i) * MIN))));
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 2, "recovered reachability widens the window");
+});
+
+test("prime: the follow-up asks only for what the window is short of", async () => {
+  const sym = "H1e";
+  seedWindow(sym, 20_000, 1700);
+  // The page lands on candles the window already holds, so on-hand history stays
+  // at 1700 and the shortfall — 300 — is what the second request should ask for.
+  fetchResponder = (url) => (url.includes("endTime")
+    ? okBatch(Array.from({ length: 300 }, (_, i) => raw(BASE + (19_700 + i) * MIN)))
+    : okBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (20_700 + i) * MIN))));
+
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 2, "1700 on hand is below the target, so it is widened");
+  assert.ok(fetchCalls[1]!.includes("limit=300"), `asked for the shortfall, not a full page: ${fetchCalls[1]}`);
+  await new Promise((r) => setTimeout(r, 20)); // the widening is fire-and-forget by design
+  assert.equal(getKlines(sym).length, 2000, "the widened window lands in order");
 });
 
 test("loadHistoricalKlines: HTTP failure -> error status", async () => {
@@ -286,6 +369,50 @@ test("loadOlderKlines: no existing data -> no fetch", async () => {
   assert.equal(fetchCalls.length, 0);
 });
 
+// ── REST vs live: a slow page must not rewind the chart ────────────────────
+
+test("a page resolving after a live tick keeps the streamed forming candle", async () => {
+  const sym = "L1";
+  seedRecent(sym, [3, 2]);
+  const forming = nowBar(1);
+  const bar = (close: string, closed: boolean) => ({ ...raw(forming, close), closed });
+  // The gateway answers with a snapshot taken before the tick: same bar, older values.
+  fetchResponder = () => ({
+    ok: true,
+    delayMs: 40,
+    body: { data: [raw(nowBar(3)), raw(nowBar(2)), bar("50", false)], meta: { venueBacked: true, canGoOlder: false } },
+  });
+
+  const p = loadHistoricalKlines(sym, "1m");
+  live(sym, bar("99", false)); // the stream touches the forming bar mid-flight
+  await p;
+
+  const ks = getKlines(sym);
+  assert.equal(ks.length, 3);
+  assert.equal(ks[ks.length - 1]!.openTime, forming);
+  assert.equal(ks[ks.length - 1]!.close, "99", "the page is older than the tick, so it loses");
+});
+
+test("a page still finalizes a bar the stream left open", async () => {
+  // Protection must not turn into "REST never applies": the venue's closed
+  // version of a bar is better information than the open one the stream wrote.
+  const sym = "L2";
+  seedRecent(sym, [3, 2]);
+  const forming = nowBar(2);
+  live(sym, { ...raw(forming, "99"), closed: false });
+  fetchResponder = () => ({
+    ok: true,
+    body: { data: [raw(forming, "60")], meta: { venueBacked: true, canGoOlder: false } },
+  });
+
+  await loadHistoricalKlines(sym, "1m");
+  const ks = getKlines(sym);
+  const last = ks[ks.length - 1]!;
+  assert.equal(last.openTime, forming);
+  assert.equal(last.close, "60", "the closed page replaces the open stream bar");
+  assert.equal(last.closed, true);
+});
+
 // ── tail refresh: the right-hand edge must keep reaching the present ──────
 
 /** openTime of the bar `minutesAgo` minutes back, aligned to the 1m grid. */
@@ -346,5 +473,85 @@ test("refreshRecentKlines: rate-limits so repeated events cannot re-arm the ladd
   fetchResponder = () => okBatch([raw(nowBar(25))]);
   assert.equal(await refreshRecentKlines(sym, "1m"), false);
   assert.equal(await refreshRecentKlines(sym, "1m"), false);
-  assert.equal(fetchCalls.length, 1, "the second call falls inside the refresh floor");
+  // One refresh; the second call falls inside the refresh floor. A short page is
+  // not followed up — that is the exchange saying there is nothing older.
+  assert.equal(fetchCalls.length, 1, "the second refresh falls inside the refresh floor");
+  assert.equal(await refreshRecentKlines(sym, "1m"), false);
+  assert.equal(fetchCalls.length, 1, "and a third event still sends nothing");
+});
+
+// ── M5b: the gateway's history state, not a page length, ends a scroll ──────
+
+/** The same venue page plus the crawl state the gateway now reports with it. */
+const deepBatch = (data: unknown[], history: Record<string, unknown>): StubResponse => ({
+  ok: true,
+  body: { data, meta: { venueBacked: true, canGoOlder: true, source: "venue", history } },
+});
+
+test("loadOlderKlines: the gateway saying history ended stops the scroll on a full page", async () => {
+  const sym = "M1_END";
+  seedWindow(sym, 3000, 100);
+  // A full page (which normally means "keep walking") that the gateway labels as
+  // the exchange's last word: the venue ended the range behind it.
+  fetchResponder = () => deepBatch(
+    Array.from({ length: 50 }, (_, i) => raw(BASE + (2950 + i) * MIN)),
+    { target: 10000, bars: 150, status: "exhausted" },
+  );
+  assert.equal(await loadOlderKlines(sym, "1m", 50), true, "the page itself is still merged");
+  assert.equal(getKlines(sym).length, 150);
+
+  const calls = fetchCalls.length;
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 60_000;
+    assert.equal(await loadOlderKlines(sym, "1m", 50), false, "an ended history is not probed again");
+    assert.equal(fetchCalls.length, calls, "and it costs no request");
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("loadOlderKlines: a full browser series is a cap, not the end of history", async () => {
+  const sym = "M2_CAP";
+  seedWindow(sym, 0, MAX_KLINES);
+  assert.equal(await loadOlderKlines(sym, "1m"), false);
+  assert.equal(fetchCalls.length, 0, "the series is already at the browser's ceiling");
+
+  // The browser shedding bars (a narrower window, a reload) reopens the scroll:
+  // a cap is a resource decision, so it must not outlive the condition that made
+  // it. An ended history would have stayed shut whatever the series looked like.
+  useMarketStore.setState((st) => ({
+    klines: { ...st.klines, [sym]: { ...st.klines[sym]!, "1m": getKlines(sym).slice(-1000) } },
+  }));
+  fetchResponder = () => okBatch(Array.from({ length: 50 }, (_, i) => raw(BASE + (MAX_KLINES - 1050 + i) * MIN)));
+  assert.equal(await loadOlderKlines(sym, "1m", 50), true, "scroll-back works again with room");
+});
+
+test("loadHistoricalKlines: a mirror already deeper than the first screen costs no second page", async () => {
+  const sym = "M3_PRIME";
+  // The gateway's crawl has the window to 4000 bars; the client asked for 1000.
+  fetchResponder = () => deepBatch(
+    Array.from({ length: 1000 }, (_, i) => raw(BASE + (20_000 + i) * MIN)),
+    { target: 10000, bars: 4000, status: "crawling" },
+  );
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 1, "the widening page would only duplicate what the mirror already holds");
+  assert.equal(getKlines(sym).length, 1000, "and the chart still starts from the page it asked for");
+});
+
+test("loadHistoricalKlines: a shallow mirror is still widened by the client", async () => {
+  const sym = "M4_PRIME";
+  // The mirror holds only the one page it was asked for, so the client's own
+  // widening page is real history and has to be fetched.
+  fetchResponder = (url) => (url.includes("endTime")
+    ? deepBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (29_000 + i) * MIN)),
+      { target: 10000, bars: 2000, status: "idle" })
+    : deepBatch(Array.from({ length: 1000 }, (_, i) => raw(BASE + (30_000 + i) * MIN)),
+      { target: 10000, bars: 1000, status: "idle" }));
+  assert.equal(await loadHistoricalKlines(sym, "1m"), true);
+  assert.equal(fetchCalls.length, 2, "one page is the chart's, the second is the first screen's history");
+  // The widening page is fire-and-forget by design: the first paint never waits
+  // for it, so it lands on a later tick.
+  for (let i = 0; i < 50 && getKlines(sym).length < 2000; i++) await new Promise((r) => setTimeout(r, 1));
+  assert.equal(getKlines(sym).length, 2000, "and it arrives without a second request");
 });

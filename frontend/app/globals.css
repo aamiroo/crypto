@@ -261,7 +261,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 240px;
+  max-width: 330px;
   padding: 3px 8px;
   font-size: 10px;
   white-space: nowrap;
