@@ -35,6 +35,19 @@ export const TIMEFRAME_SPAN_MS: Record<Timeframe, number> = {
 const MIN_OPEN_TIME = 946684800000; // 2000-01-01
 const MAX_OPEN_TIME = 4102444800000; // 2100-01-01
 
+/** How far behind the present a window may fall before it counts as frozen.
+ *  Covers a couple of 1m bars plus normal delivery jitter. */
+export const RECENT_TAIL_MS = 120_000;
+
+/** True when this candle still covers the present moment, so it owns the
+ *  right-hand edge of the chart. Lives here because both the REST layer (heal a
+ *  frozen tail) and the store (decide whether a replayed bar may claim
+ *  precedence over a page) need the same test, and neither may import the other. */
+export function isCurrentBar(k: KlineData): boolean {
+  const span = TIMEFRAME_SPAN_MS[k.interval as Timeframe] ?? 60_000;
+  return k.openTime + span > Date.now() - RECENT_TAIL_MS;
+}
+
 /** Unique key for a (symbol, interval) kline window. */
 export function klineKey(symbol: string, interval: string): string {
   return `${symbol}:${interval}`;

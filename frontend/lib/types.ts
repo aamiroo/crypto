@@ -33,6 +33,11 @@ export interface KlineData {
   closed: boolean;
 }
 
+/** `kline_snapshot`: the gateway's answer to a kline subscribe — the bars it
+ *  cached, collapsed to the newest tick per openTime. `interval` is top level
+ *  because the client keys sequence recovery on (channel, symbol, interval). */
+export interface KlineSnapshotData { interval: string; candles: KlineData[]; }
+
 export interface TickerData {
   lastPrice: string;
   bidPrice?: string;

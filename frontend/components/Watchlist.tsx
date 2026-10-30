@@ -28,25 +28,29 @@ export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
 
   const favSet = useMemo(() => new Set(favorites), [favorites]);
 
+  // Only the ticker-sorted views read the map, so the default alphabetical list
+  // does not re-filter and re-sort on every 250 ms ticker flush.
+  const sortTickers = sort === "sym" ? null : tickers;
+
   const rows = useMemo(() => {
     const universe = tab === "favorites"
       ? (favorites.length ? favorites : symbols.slice(0, 30))
       : symbols;
     const q = query.trim().toUpperCase();
     let list = q ? universe.filter((s) => s.includes(q)) : universe;
-    if (sort !== "sym") {
+    if (sort !== "sym" && sortTickers) {
       list = [...list].sort((a, b) => {
-        const ta = tickers[a], tb = tickers[b];
+        const ta = sortTickers[a], tb = sortTickers[b];
         if (!ta || !tb) return Number(!!tb) - Number(!!ta);
         if (sort === "price") return parseFloat(tb.lastPrice) - parseFloat(ta.lastPrice);
         if (sort === "change") return parseFloat(tb.change24h) - parseFloat(ta.change24h);
         return parseFloat(tb.volume24h) - parseFloat(ta.volume24h);
       });
-    } else if (!asc) {
+    } else if (sort === "sym" && !asc) {
       list = [...list].reverse();
     }
     return list;
-  }, [tab, favorites, symbols, query, sort, asc, tickers]);
+  }, [tab, favorites, symbols, query, sort, asc, sortTickers]);
 
   const virt = useVirtualList(rows.length, ROW_H);
   const scroller = useRef<HTMLDivElement>(null);

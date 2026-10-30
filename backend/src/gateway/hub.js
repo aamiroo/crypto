@@ -1,6 +1,6 @@
 import { Sequencer } from "./sequencer.js";
 
-const KLINES_REPLAY = 500;      // candles replayed to a new kline subscriber
+const KLINES_REPLAY = 500;      // distinct bars kept for the kline snapshot replay
 const KLINES_TOPICS_MAX = 256;  // (symbol, interval) histories kept in memory
 const BOOK_TTL_MS = 5 * 60_000; // idle order books dropped after this
 const LATEST_TTL_MS = 10 * 60_000;
@@ -9,8 +9,9 @@ const SWEEP_MS = 60_000;
 export class Hub {
   /** Three caches back the three replay paths in `subscribe`: `books` is keyed
    *  without interval and always rebuilt at the current seq, `latest` holds one
-   *  envelope per topic, `klineHistory` is LRU-capped. The sweep timer is unref'd
-   *  so it can never hold the process open on its own. */
+   *  envelope per topic, `klineHistory` collapses the ticks of each topic into one
+   *  bar per openTime and is LRU-capped. The sweep timer is unref'd so it can
+   *  never hold the process open on its own. */
   constructor(logger, opts = {}) {
     this.logger = logger;
     this.bookTtlMs = opts.bookTtlMs ?? BOOK_TTL_MS;
@@ -19,7 +20,7 @@ export class Hub {
     this.subs = new Map();        // topic -> Set<Client>
     this.seq = new Sequencer();
     this.books = new Map();       // topic -> { seq, ts, bids: Map, asks: Map }
-    this.klineHistory = new Map(); // topic -> env[] (LRU by topic)
+    this.klineHistory = new Map(); // topic -> { seq, ts, interval, bars: Map }
     this.latest = new Map();      // topic -> { ts, env } for ticker/trade replay
     this._sweep = setInterval(() => this.sweep(), opts.sweepMs ?? SWEEP_MS);
     this._sweep.unref?.();
@@ -62,8 +63,11 @@ export class Hub {
       const book = this.books.get(topicKey(channel, symbol));
       if (book) c.send(snapshotEnv(symbol, book));
     } else if (channel === "kline") {
-      const hist = this.klineHistory.get(t);
-      if (hist) for (const env of hist) c.send(env);
+      // One collapsed frame, not the ≤500 individual ticks the venue happened to
+      // push: each replayed frame used to be a separate store commit and a
+      // separate chart diff on the client.
+      const snap = this.klineHistory.get(t);
+      if (snap && snap.bars.size > 0) c.send(klineSnapshotEnv(symbol, snap));
     } else {
       // Ticker/trade streams are sparse per symbol (Bybit only pushes tickers
       // for traded pairs), so replay the last known value immediately. Without
@@ -134,14 +138,26 @@ export class Hub {
     const seq = this.seq.next("kline", symbol, interval);
     const env = { type: "kline", channel: "kline", symbol, seq, ts, data };
     const t = topicKey("kline", symbol, interval);
-    // Cache klines for replay, most-recently-used order so long-tail symbols
-    // cannot grow the map without bound.
-    if (!this.klineHistory.has(t)) this.klineHistory.set(t, []);
-    const hist = this.klineHistory.get(t);
-    this.klineHistory.delete(t);
-    this.klineHistory.set(t, hist);
-    hist.push(env);
-    if (hist.length > KLINES_REPLAY) hist.splice(0, hist.length - KLINES_REPLAY);
+    let snap = this.klineHistory.get(t);
+    if (!snap) {
+      snap = { seq, ts, interval, bars: new Map() };
+    } else {
+      // LRU touch: re-insert so `sweep` walks the least-recently-written first.
+      this.klineHistory.delete(t);
+    }
+    this.klineHistory.set(t, snap);
+    snap.seq = seq;
+    snap.ts = ts;
+    snap.interval = interval;
+    const openTime = Number(data.openTime);
+    if (Number.isFinite(openTime)) {
+      // Collapsed on write: the venue repeats the same candle several times before
+      // it closes, and the newest tick is the truth for it, so the cache is bounded
+      // by bar count rather than by tick count. Bars arrive ascending, so the
+      // insertion order is the time order and the first key is the oldest bar.
+      snap.bars.set(openTime, data);
+      while (snap.bars.size > KLINES_REPLAY) snap.bars.delete(snap.bars.keys().next().value);
+    }
     this._broadcast(t, env);
   }
 
@@ -197,6 +213,25 @@ function snapshotEnv(symbol, book) {
     seq: book.seq,
     ts: book.ts,
     data: { bids: [...book.bids], asks: [...book.asks] },
+  };
+}
+
+/** The collapsed bars of one topic as a single frame. `seq` is the newest minted
+ *  for this topic, so the first live kline after it is exactly `seq + 1` and the
+ *  client's gap test stays honest — and `interval` sits at the top of `data`
+ *  because the client keys sequence recovery on (channel, symbol, interval): put
+ *  it only inside each candle and every bar reads as a gap. */
+function klineSnapshotEnv(symbol, snap) {
+  return {
+    type: "kline_snapshot",
+    channel: "kline",
+    symbol,
+    seq: snap.seq,
+    ts: snap.ts,
+    data: {
+      interval: snap.interval,
+      candles: [...snap.bars.values()].sort((a, b) => Number(a.openTime) - Number(b.openTime)),
+    },
   };
 }
 

@@ -5,7 +5,10 @@ type StateListener = (connected: boolean) => void;
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
-const PING_INTERVAL_MS = 15000;
+/** 8 s × 3 missed pongs: a socket that dies quietly (a proxy dropping it without
+ *  a close event) freezes the chart for ~24-32 s. At the old 15 s the freeze ran
+ *  past 45 s, well after the UI had already declared itself STALE. */
+const PING_INTERVAL_MS = 8000;
 const MAX_MISSED_PONGS = 3; // PROTOCOL.md §2: reconnect after 3 missed pongs
 const SUBSCRIBE_BATCH = 50; // topics per subscribe frame
 

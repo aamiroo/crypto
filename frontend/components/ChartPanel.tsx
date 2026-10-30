@@ -68,6 +68,14 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   const tfRef = useRef<Timeframe | null>(null);
   /** Set by a timeframe switch; cleared once the switched-to window has landed. */
   const fitPendingRef = useRef(false);
+  /** The symbol whose candles are currently painted. A switch away from it must
+   *  repaint from scratch; a timeframe switch may keep the frame. */
+  const paintedSymRef = useRef<string>(symbol);
+  /** True while the painted frame belongs to the timeframe the user left, and the
+   *  new one is still arriving. It is what lets the chart stay drawn instead of
+   *  blanking for the length of a history load. */
+  const staleViewRef = useRef(false);
+  const [staleView, setStaleView] = useState(false);
   const visRef = useRef<string>("");
   const [chartEpoch, setChartEpoch] = useState(0);
   const [indRefresh, setIndRefresh] = useState(0);
@@ -112,6 +120,8 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     themeApplied.current = theme;
     // The previous chart instance is gone — force a full re-push of data.
     lastRef.current = EMPTY_KLINES;
+    // A fresh instance has nothing painted, so there is no stale frame to keep.
+    staleViewRef.current = false;
     timeIdxRef.current = new Map();
     idxRef.current = new Map();
 
@@ -192,6 +202,17 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     const plan = diffKlines(prev, klines);
     if (plan.kind === "noop") return;
 
+    /** Painted-frame bookkeeping: notifying React only when the flag actually
+     *  flips, so a per-tick effect run never re-renders the panel. */
+    const markStale = (v: boolean) => {
+      if (staleViewRef.current === v) return;
+      staleViewRef.current = v;
+      setStaleView(v);
+    };
+    // Recorded before the empty branch below, which keeps the old frame painted.
+    const switchedSymbol = paintedSymRef.current !== symbol;
+    paintedSymRef.current = symbol;
+
     const colors = getTc(theme);
     const ensureAlt = (kind: AltKind): AltSeries => {
       const store = altRef.current;
@@ -230,7 +251,15 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     };
 
     if (plan.kind === "empty") {
-      // Clear every series so a symbol/timeframe switch never shows stale bars.
+      if (!switchedSymbol && prev.length > 0) {
+        // Timeframe switch with the new window still in flight: keep the previous
+        // candles painted and let the overlay say what is loading. A blank chart
+        // reads as a failed load; a drawn one with a hint does not.
+        markStale(true);
+        return;
+      }
+      markStale(false);
+      // Clear every series so a symbol switch never shows the old pair's bars.
       cs.setData([]);
       vs.setData([]);
       altRef.current.line?.setData([]);
@@ -239,6 +268,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
       timeIdxRef.current = new Map();
       return;
     }
+    markStale(false);
 
     // A timeframe switch invalidates the current zoom: the visible window was
     // measured in the *old* bar size, so reusing it on 4h candles after being
@@ -314,7 +344,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     const order = new Map<Time, number>();
     for (let i = 0; i < bars.length; i++) order.set(Math.floor(bars[i]!.openTime / 1000) as Time, i);
     idxRef.current = order;
-  }, [klines, tf, status, ct, theme, chartEpoch]);
+  }, [klines, symbol, tf, status, ct, theme, chartEpoch]);
 
   // ── Indicators: stable series registry, refreshed at most 1×/s ───────
   useEffect(() => {
@@ -490,7 +520,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   return (
     <div className="relative h-full w-full">
       <CrossInfo />
-      <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} connected={connected} onRetry={retry} />
+      <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} staleView={staleView} connected={connected} onRetry={retry} />
       <div ref={chartHostRef} className="h-full w-full" />
       <DrawingLayer chartRef={chRef} mainRef={mainRef} hostRef={chartHostRef} symbol={symbol} epoch={chartEpoch} />
       <DrawingsPanel symbol={symbol} />
@@ -524,26 +554,36 @@ function CrossInfo() {
 
 /** Loading / empty / error states rendered above the (interactive) chart. */
 function ChartStateOverlay({
-  symbol, timeframe, status, count, connected, onRetry,
+  symbol, timeframe, status, count, staleView, connected, onRetry,
 }: {
   symbol: string;
   timeframe: string;
   status: KlineStatus | undefined;
   count: number;
+  /** The candles of the timeframe the user left are still painted. */
+  staleView: boolean;
   connected: boolean;
   onRetry: () => void;
 }) {
   const state = status?.state ?? "idle";
 
+  /** Corner badge: used whenever there is something on the chart to look at, so a
+   *  load in progress never hides the candles behind a full-face overlay. */
+  const badge = (text: string) => (
+    <div className="pointer-events-none absolute top-1 right-16 z-10 rounded px-2 py-1 text-[10px]"
+      style={{ background: "var(--bg-surface)", color: "var(--warning)", border: "1px solid var(--border)" }}>
+      {text}
+    </div>
+  );
+
   if (count > 0) {
-    if (state === "error") {
-      return (
-        <div className="pointer-events-none absolute top-1 right-16 z-10 rounded px-2 py-1 text-[10px]"
-          style={{ background: "var(--bg-surface)", color: "var(--warning)", border: "1px solid var(--border)" }}>
-          History unavailable — showing live data only
-        </div>
-      );
-    }
+    if (state === "error") return badge("History unavailable — showing live data only");
+    return null;
+  }
+
+  if (staleView) {
+    if (state === "loading") return badge(`Loading ${symbol} · ${timeframe} history…`);
+    if (state === "error") return badge(`History unavailable for ${timeframe} — showing the previous candles`);
     return null;
   }
 

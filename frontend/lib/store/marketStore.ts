@@ -1,9 +1,11 @@
 import { create } from "zustand";
 import type {
-  Envelope, KlineData, OrderBookDeltaData, OrderBookSnapshotData, PriceLevel,
+  Envelope, KlineData, KlineSnapshotData, OrderBookDeltaData, OrderBookSnapshotData, PriceLevel,
   SymbolsData, TickerData, TradeData,
 } from "@/lib/types";
-import { EMPTY_KLINES, MAX_KLINES, klineKey, mergeKlines, mergeRawKline } from "@/lib/utils/klines";
+import {
+  EMPTY_KLINES, MAX_KLINES, isCurrentBar, klineKey, mergeKlines, mergeRawKline, normalizeKlines,
+} from "@/lib/utils/klines";
 import type { CandlePrecedence } from "@/lib/utils/klines";
 import { setInstruments } from "@/lib/utils/symbol";
 
@@ -35,6 +37,11 @@ interface MarketState {
 const MAX_TRADES = 100;
 const TICKER_BATCH_MS = 250;
 const MESSAGE_TS_STEP_MS = 1000;
+
+/** Stable reference for "no trades for this symbol yet": a selector that returned
+ *  a fresh `[]` handed the component a new array identity on every unrelated
+ *  store notification, which re-rendered the whole list several times a second. */
+export const EMPTY_TRADES: TradeData[] = [];
 
 /** Per window: the newest candle the websocket wrote, and which tick wrote it.
  *  Kept outside the store — it is bookkeeping for merge precedence, not
@@ -144,6 +151,26 @@ export const useMarketStore = create<MarketState>((set, get) => ({
           const list = [trade, ...(st.recentTrades[sym] ?? [])].slice(0, MAX_TRADES);
           return { recentTrades: { ...st.recentTrades, [sym]: list } };
         });
+        break;
+      }
+      case "kline_snapshot": {
+        // A kline subscribe is answered with one collapsed frame instead of the
+        // individual ticks the gateway cached, so this is the bulk path: one
+        // commit and one merge for the whole burst.
+        const raw = env.data as KlineSnapshotData | undefined;
+        const interval = raw?.interval || "1m";
+        const candles = normalizeKlines(raw?.candles, interval);
+        if (candles.length === 0) break;
+        // No cursor: a stream replay is the newer source and wins outright, the
+        // same rule `mergeKlinesInto` already applies to a bulk merge.
+        get().mergeKlinesInto(sym, interval, candles);
+        // Only a bar that still covers the present may claim the right-hand edge.
+        // A topic that went quiet hours ago is still replayed on reconnect, and an
+        // ancient bar must not defer a fresh REST page that knows it closed.
+        const newest = candles[candles.length - 1]!;
+        if (isCurrentBar(newest)) {
+          liveTick.set(klineKey(sym, interval), { openTime: newest.openTime, seq: ++tickSeq });
+        }
         break;
       }
       case "kline": {

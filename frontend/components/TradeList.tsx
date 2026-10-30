@@ -1,9 +1,9 @@
 "use client";
-import { useMarketStore } from "@/lib/store/marketStore";
+import { useMarketStore, EMPTY_TRADES } from "@/lib/store/marketStore";
 import { fmtPrice, fmtQty, fmtTime } from "@/lib/utils/format";
 
 export function TradeList({ symbol }: { symbol: string }) {
-  const trades = useMarketStore((s) => s.recentTrades[symbol] ?? []);
+  const trades = useMarketStore((s) => s.recentTrades[symbol] ?? EMPTY_TRADES);
   return (
     <div className="flex h-full flex-col overflow-hidden text-[11px]" style={{ background: "var(--bg-panel)" }}>
       <div className="panel-header flex-shrink-0 border-b" style={{ borderColor: "var(--border)" }}>Recent Trades</div>

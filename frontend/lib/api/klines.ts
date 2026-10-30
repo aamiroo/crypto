@@ -1,6 +1,6 @@
 import { useMarketStore, klineTickCursor } from "@/lib/store/marketStore";
 import {
-  EMPTY_KLINES, MAX_KLINES, TIMEFRAME_SPAN_MS, klineKey, normalizeKlines,
+  EMPTY_KLINES, MAX_KLINES, isCurrentBar, klineKey, normalizeKlines,
 } from "@/lib/utils/klines";
 import type { KlineData, Timeframe } from "@/lib/types";
 
@@ -190,9 +190,6 @@ function primeOlder(
   void loadOlderKlines(symbol, interval, Math.min(BACKFILL_LIMIT, HISTORY_TARGET - have));
 }
 
-/** How far behind the present a window may fall before it counts as frozen.
- *  Covers a couple of 1m bars plus normal delivery jitter. */
-const RECENT_TAIL_MS = 120_000;
 /** Floor between tail refreshes. `loadHistoricalKlines` re-arms its retry
  *  ladder on every call, so an unguarded refresh would defeat the decay. */
 const REFRESH_MIN_MS = 30_000;
@@ -202,9 +199,7 @@ const lastRefreshAt = new Map<string, number>();
 /** True when the newest stored candle still covers the present moment. */
 export function hasRecentTail(klines: KlineData[]): boolean {
   const last = klines[klines.length - 1];
-  if (!last) return false;
-  const span = TIMEFRAME_SPAN_MS[last.interval as Timeframe] ?? 60_000;
-  return last.openTime + span > Date.now() - RECENT_TAIL_MS;
+  return last ? isCurrentBar(last) : false;
 }
 
 /**
