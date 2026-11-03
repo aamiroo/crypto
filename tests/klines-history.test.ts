@@ -21,6 +21,9 @@ const MIN = 60_000;
 /** Anchored to the hour so a bar's own span is never in doubt, and far enough in
  *  the past that no fixture can be mistaken for the future. */
 const BASE = Math.floor(1_700_000_000_000 / MIN) * MIN;
+/** The same anchor on the hour grid, for the windows that are not 1 m: an hourly
+ *  bar opens at 00 minutes, and a bar that does not is rejected as malformed. */
+const HOUR = Math.floor(1_700_000_000_000 / 3600e3) * 3600e3;
 /** New end of a window that has to still count as reaching the present. */
 const NOW = Math.floor(Date.now() / MIN) * MIN;
 
@@ -41,9 +44,6 @@ function candleAt(openTime: number) {
     open: "1", high: "2", low: "0.5", close: "1.5", volume: "3", closed: true,
   };
 }
-function candle(n: number) {
-  return candleAt(BASE + n * MIN);
-}
 /** A bar `n` minutes before the present: what a restored window needs to still
  *  be allowed to answer a "what is recent" read. */
 function recent(n: number) {
@@ -53,6 +53,14 @@ function recent(n: number) {
 /** Ascending run of `count` candles ending at `endOpen` (inclusive). */
 function run(count: number, endOpen: number) {
   return Array.from({ length: count }, (_, i) => candleAt(endOpen - (count - 1 - i) * MIN));
+}
+
+/** `count` candles ending at the present. A window the crawl is allowed to
+ *  *finish*: a gap is measured against now, so the same twenty bars parked in
+ *  2023 are a window with three years of market missing in front of it, and the
+ *  crawl's job is now to refuse to call that complete. */
+function liveRun(count: number) {
+  return run(count, NOW);
 }
 
 /** Floor a requested `end` onto a bar boundary: Bybit never returns a candle
@@ -97,31 +105,32 @@ function venue(history: { from?: number; until?: number } = {}) {
 
 test("crawl: 1000-candle pages join with no duplicated boundary and no hole", async () => {
   const s = store("walk", { depthTargets: { "1m": 4000 } });
-  // What the client's own first page landed: bars 3000..3999.
-  s.remember("BTCUSDT", "1m", Array.from({ length: 1000 }, (_, i) => candle(3000 + i)));
+  // What the client's own first page landed: the newest 1000 bars, up to now.
+  s.remember("BTCUSDT", "1m", liveRun(1000));
   const v = venue();
   const c = createKlineCrawler({ store: s, fetchPage: v.fetchPage, logger: silentLogger, gapMs: 5 });
   try {
     c.trigger("BTCUSDT", "1m");
     await until(() => s.progress("BTCUSDT", "1m").status === "complete", 4000, "the depth target");
     assert.equal(v.calls.length, 3, "one page per step, three to reach the target");
-    assert.equal(v.calls[0]!.endTime, BASE + 3000 * MIN - 1, "the first page starts one ms before the oldest bar held");
-    assert.equal(v.calls[1]!.endTime, BASE + 2000 * MIN - 1, "the next from where the last one ended");
-    assert.equal(v.calls[2]!.endTime, BASE + 1000 * MIN - 1);
+    assert.equal(v.calls[0]!.endTime, NOW - 999 * MIN - 1, "the first page starts one ms before the oldest bar held");
+    assert.equal(v.calls[1]!.endTime, NOW - 1999 * MIN - 1, "the next from where the last one ended");
+    assert.equal(v.calls[2]!.endTime, NOW - 2999 * MIN - 1);
     assert.ok(v.calls.every((call) => call.limit === CRAWL_PAGE), "each page is the venue's own 1000 ceiling");
 
-    const all = s.candlesBefore("BTCUSDT", "1m", BASE + 3999 * MIN, 4000)!;
+    const all = s.candlesBefore("BTCUSDT", "1m", NOW, 4000)!;
     assert.equal(all.length, 4000);
     assert.equal(new Set(all.map((k) => k.openTime)).size, 4000, "no bar is held twice");
     assert.equal(all[all.length - 1]!.openTime - all[0]!.openTime, 3999 * MIN, "and no bar is missing between them");
     assert.equal(s.progress("BTCUSDT", "1m").venueBars, 4000, "every one of them came from the venue");
+    assert.equal(s.progress("BTCUSDT", "1m").gap, null, "a window this deep is also this unbroken");
   } finally { c.stop(); }
 });
 
 test("crawl: it stops asking once the depth target is met", async () => {
   const s = store("target", { depthTargets: { "1m": 30 } });
-  s.remember("BTCUSDT", "1m", Array.from({ length: 20 }, (_, i) => candle(100 + i)));
-  const v = venue({ from: BASE, until: BASE + 99 * MIN });
+  s.remember("BTCUSDT", "1m", liveRun(20));
+  const v = venue({ from: NOW - 99 * MIN, until: NOW });
   const c = createKlineCrawler({ store: s, fetchPage: v.fetchPage, logger: silentLogger, page: 10, gapMs: 5 });
   try {
     c.trigger("BTCUSDT", "1m");
@@ -136,14 +145,16 @@ test("crawl: it stops asking once the depth target is met", async () => {
 
 test("crawl: a venue page that ends the range is history, and is recorded as such", async () => {
   const s = store("ended");
-  s.remember("BTCUSDT", "1m", Array.from({ length: 12 }, (_, i) => candle(10 + i)));
-  const v = venue({ from: BASE, until: BASE + 11 * MIN });
+  s.remember("BTCUSDT", "1m", liveRun(12));
+  // Eleven bars older than the window holds and nothing older than them: the
+  // fixture's whole range is twenty-three minutes, ending at the present.
+  const v = venue({ from: NOW - 22 * MIN, until: NOW });
   const c = createKlineCrawler({ store: s, fetchPage: v.fetchPage, logger: silentLogger, page: 10, gapMs: 5 });
   try {
     c.trigger("BTCUSDT", "1m");
     await until(() => s.progress("BTCUSDT", "1m").status === "exhausted", 3000, "the fixture's whole history to be walked");
     const after = s.progress("BTCUSDT", "1m");
-    assert.equal(after.bars, 22, "ten bars on the first page, then the last two, then nothing");
+    assert.equal(after.bars, 23, "the twelve held, then a full page of ten, then the last bar standing");
     assert.equal(v.calls.length, 2);
     assert.equal(after.nextRetryAt, 0, "an ended range has no next attempt to schedule");
     assert.ok(after.exhaustedAt > 0, "and when it ended is recorded, separate from how deep we are");
@@ -155,7 +166,7 @@ test("crawl: a venue page that ends the range is history, and is recorded as suc
 
 test("crawl: a refusal is a wait, never the end of history", async () => {
   const s = store("refused");
-  s.remember("BTCUSDT", "1m", Array.from({ length: 12 }, (_, i) => candle(10 + i)));
+  s.remember("BTCUSDT", "1m", liveRun(12));
   const before = s.progress("BTCUSDT", "1m").cursor;
   const c = createKlineCrawler({
     store: s, logger: silentLogger, page: 10, gapMs: 5, backoffMs: 20,
@@ -176,7 +187,7 @@ test("crawl: a refusal is a wait, never the end of history", async () => {
 
 test("crawl: a lane that will not go out, or our own mirror, teaches nothing", async () => {
   const s = store("no-answer");
-  s.remember("BTCUSDT", "1m", Array.from({ length: 12 }, (_, i) => candle(10 + i)));
+  s.remember("BTCUSDT", "1m", liveRun(12));
   const owed = s.progress("BTCUSDT", "1m").cursor;
   let mode = "cool";
   const c = createKlineCrawler({
@@ -204,7 +215,7 @@ test("crawl: a lane that will not go out, or our own mirror, teaches nothing", a
 
 test("crawl: after a 403 the next page continues from the preserved cursor", async () => {
   const s = store("resume-after-error", { depthTargets: { "1m": 100 } });
-  s.remember("BTCUSDT", "1m", Array.from({ length: 40 }, (_, i) => candle(200 + i)));
+  s.remember("BTCUSDT", "1m", liveRun(40));
   let blocked = true;
   const asked: (number | null)[] = [];
   const c = createKlineCrawler({
@@ -222,7 +233,7 @@ test("crawl: after a 403 the next page continues from the preserved cursor", asy
     const owed = s.progress("BTCUSDT", "1m").cursor;
     await until(() => s.progress("BTCUSDT", "1m").bars >= 70, 4000, "the crawl to pick the pages back up");
     assert.ok(asked.includes(owed), `the recovered crawl asks for the owed page (${owed}), not a new range`);
-    const all = s.candlesBefore("BTCUSDT", "1m", BASE + 239 * MIN, 200)!;
+    const all = s.candlesBefore("BTCUSDT", "1m", NOW, 200)!;
     assert.equal(new Set(all.map((k) => k.openTime)).size, all.length, "the retried page did not duplicate a bar");
     assert.equal(all[all.length - 1]!.openTime - all[0]!.openTime, (all.length - 1) * MIN, "and did not skip one");
     assert.equal(s.progress("BTCUSDT", "1m").attempts, 0, "a page that landed clears the failure streak");
@@ -272,7 +283,7 @@ test("crawl: a restart resumes from the stored cursor instead of starting over",
 
 test("crawl: one window never crawls twice, however many callers want it", async () => {
   const s = store("single", { depthTargets: { "1m": 1000 } });
-  s.remember("BTCUSDT", "1m", Array.from({ length: 50 }, (_, i) => candle(500 + i)));
+  s.remember("BTCUSDT", "1m", liveRun(50));
   let inFlight = 0;
   let maxConcurrent = 0;
   const calls: number[] = [];
@@ -326,12 +337,12 @@ test("store: eviction leaves the bytes on disk and reloads them on the next read
 
 test("store: an active crawl keeps its bytes and its cursor through eviction", () => {
   const s = store("crawling-lru", { hotWindows: 1 });
-  s.remember("BTCUSDT", "1m", Array.from({ length: 30 }, (_, i) => candle(30 + i)));
+  s.remember("BTCUSDT", "1m", liveRun(30));
   s.markProgress("BTCUSDT", "1m", { status: "crawling" });
   const cursor = s.progress("BTCUSDT", "1m").cursor;
-  s.remember("ETHUSDT", "1m", Array.from({ length: 30 }, (_, i) => candle(30 + i)));
-  s.remember("SOLUSDT", "1m", Array.from({ length: 30 }, (_, i) => candle(30 + i)));
-  assert.equal(cursor, BASE + 30 * MIN - 1);
+  s.remember("ETHUSDT", "1m", liveRun(30));
+  s.remember("SOLUSDT", "1m", liveRun(30));
+  assert.equal(cursor, NOW - 29 * MIN - 1, "one ms before the oldest bar the window holds");
   assert.equal(s.isLoaded("BTCUSDT", "1m"), true, "a window with a page in flight is never the LRU's victim");
   assert.equal(s.progress("BTCUSDT", "1m").cursor, cursor, "so the page merges against the window it belongs to");
   assert.equal(s.hotCount(), 1, "everything else still obeys the cap");
@@ -515,10 +526,171 @@ test("store: a stale window keeps its history but stops claiming the live edge",
   const file = mirror("stale");
   const a = createKlinesStore({ file, logger: silentLogger });
   // Three months of 1h bars, plus a live 1m tail that never got a new bar.
-  a.remember("BTCUSDT", "1h", Array.from({ length: 30 }, (_, i) => candleAt(BASE + i * 3600e3)));
+  a.remember("BTCUSDT", "1h", Array.from({ length: 30 }, (_, i) => candleAt(HOUR + i * 3600e3)));
   await a.flush();
   const b = await createKlinesStore({ file, logger: silentLogger }).load();
   assert.equal(b.progress("BTCUSDT", "1h").bars, 30, "restored depth");
   assert.equal(b.candles("BTCUSDT", "1h", 500), null, "too old to be the recent window");
-  assert.equal(b.candlesBefore("BTCUSDT", "1h", BASE + 29 * 3600e3, 10)!.length, 10, "but exactly what a scroll-back asks for");
+  assert.equal(b.candlesBefore("BTCUSDT", "1h", HOUR + 29 * 3600e3, 10)!.length, 10, "but exactly what a scroll-back asks for");
+});
+
+/* ── the holes a downtime leaves behind ────────────────────────────────── */
+
+/**
+ * A gateway that was down while the market kept printing comes back with a
+ * window that is full of holes: the bars either side of the outage are
+ * neighbours in the array, so the chart paints a continuous axis over an absent
+ * afternoon and a depth count that says "complete". What has to be proven is
+ * that the store can see the absence, that the crawl digs for it before it digs
+ * for more depth, and that nothing about a hole is ever recorded as the end of
+ * history.
+ */
+
+test("gap: a window as deep as the policy asked, and hollow in the middle", () => {
+  const s = store("hollow", { depthTargets: { "1m": 22 } });
+  // Twelve bars up to this minute, ten that stopped an hour ago: the count is at
+  // the target, and the chart has a hole in the middle of it.
+  s.remember("BTCUSDT", "1m", [...liveRun(12), ...run(10, NOW - 60 * MIN)]);
+  const p = s.progress("BTCUSDT", "1m");
+  assert.equal(p.bars, 22, "as deep as the policy asked");
+  assert.equal(p.gap?.bars, 48, "and forty-eight minutes of market never mirrored");
+  assert.equal(p.gap?.from, NOW - 59 * MIN, "the run starts at the first slot after the old group");
+  assert.equal(p.gap?.to, NOW - 12 * MIN, "and ends at the last slot before the recent one");
+  assert.equal(p.current, true, "the tail it does hold still reaches the present");
+});
+
+test("gap: the crawl digs for the hole before it digs for depth", async () => {
+  const s = store("fill", { depthTargets: { "1m": 60 } });
+  s.remember("BTCUSDT", "1m", [...liveRun(12), ...run(10, NOW - 60 * MIN)]);
+  const v = venue({ from: NOW - 4000 * MIN, until: NOW });
+  const c = createKlineCrawler({ store: s, fetchPage: v.fetchPage, logger: silentLogger, page: 10, gapMs: 5 });
+  try {
+    c.trigger("BTCUSDT", "1m");
+    await until(() => s.progress("BTCUSDT", "1m").gap === null, 3000, "the hole to be filled");
+    assert.equal(v.calls[0]!.endTime, NOW - 12 * MIN, "the first ask is the newest end of the hole, not the depth cursor");
+    assert.ok(v.calls[0]!.limit < CRAWL_PAGE, "and it asks for the size of the hole, not a full page");
+
+    const all = s.candles("BTCUSDT", "1m", 1000)!;
+    assert.equal(new Set(all.map((k) => k.openTime)).size, all.length, "nothing arrived twice");
+    assert.equal(all[all.length - 1]!.openTime - all[0]!.openTime, (all.length - 1) * MIN, "and nothing is missing between them");
+    await until(() => s.progress("BTCUSDT", "1m").status === "complete", 3000, "the finished window to be labelled");
+    assert.equal(s.progress("BTCUSDT", "1m").gap, null, "deep and unbroken, which is the only way to be finished");
+  } finally { c.stop(); }
+});
+
+test("gap: a frozen tail is healed and the live edge is earned back", async () => {
+  const s = store("frozen", { depthTargets: { "1m": 1000 } });
+  s.remember("BTCUSDT", "1m", run(20, NOW - 300 * MIN)); // five hours of silence
+  const before = s.progress("BTCUSDT", "1m");
+  assert.equal(before.current, false, "five hours behind is history, not the live edge");
+  assert.equal(before.gap?.bars, 299, "and every minute since the last bar is absent");
+
+  const v = venue({ from: NOW - 1000 * MIN, until: NOW });
+  const c = createKlineCrawler({ store: s, fetchPage: v.fetchPage, logger: silentLogger, page: 100, gapMs: 5 });
+  try {
+    c.trigger("BTCUSDT", "1m");
+    await until(() => s.progress("BTCUSDT", "1m").current === true, 3000, "the venue to bring the window back to now");
+    assert.equal(v.calls[0]!.endTime, NOW - MIN, "the ask is the newest missing minute");
+    await until(() => s.progress("BTCUSDT", "1m").gap === null, 4000, "the whole silence to be filled");
+    const all = s.candles("BTCUSDT", "1m", 5000)!;
+    assert.equal(all[all.length - 1]!.openTime, NOW - MIN, "the heal ends at the newest missing minute — the bar covering now is still forming and belongs to the stream");
+    assert.equal(all[all.length - 1]!.openTime - all[0]!.openTime, (all.length - 1) * MIN, "with every bar in between");
+  } finally { c.stop(); }
+});
+
+test("gap: a short page inside a hole is not the exchange ending history", async () => {
+  const s = store("short-middle", { depthTargets: { "1m": 1000 } });
+  s.remember("BTCUSDT", "1m", [...liveRun(10), ...run(10, NOW - 60 * MIN)]);
+  const before = s.progress("BTCUSDT", "1m").gap!.bars;
+  const c = createKlineCrawler({
+    store: s, logger: silentLogger, page: 10, gapMs: 5, backoffMs: 20,
+    // Three bars however many were asked for: a hole answered partially says
+    // nothing about where history ends, because the bars after it are already held.
+    async fetchPage(_sym, _iv, _limit, endTime) {
+      return { data: run(3, alignDown(endTime as number)), source: "venue" };
+    },
+  });
+  try {
+    c.trigger("BTCUSDT", "1m");
+    await until(() => (s.progress("BTCUSDT", "1m").gap?.bars ?? 0) < before - 2, 3000, "the hole to shrink");
+    const p = s.progress("BTCUSDT", "1m");
+    assert.notEqual(p.status, "exhausted", "a partial page inside a hole never ends the range");
+    assert.ok(p.gap && p.gap.bars > 0, "and the window stays open while the hole is still there");
+  } finally { c.stop(); }
+});
+
+test("gap: a hole the venue will not fill is waited out, not spun against", async () => {
+  const s = store("unfillable", { depthTargets: { "1m": 1000 } });
+  s.remember("BTCUSDT", "1m", [...liveRun(10), ...run(10, NOW - 60 * MIN)]);
+  const held = s.progress("BTCUSDT", "1m").bars;
+  const asked: (number | null)[] = [];
+  const c = createKlineCrawler({
+    store: s, logger: silentLogger, page: 10, gapMs: 5, backoffMs: 200,
+    async fetchPage(_sym, _iv, _limit, endTime) {
+      asked.push(endTime);
+      // The venue answers with bars the window already holds: the slots inside the
+      // hole are not coming, and that is a reason to wait, not a fact about history.
+      return { data: run(2, NOW - MIN), source: "venue" };
+    },
+  });
+  try {
+    c.trigger("BTCUSDT", "1m");
+    await until(() => s.progress("BTCUSDT", "1m").status === "waiting", 3000, "the unfilled page to settle");
+    const p = s.progress("BTCUSDT", "1m");
+    assert.equal(p.bars, held, "a page of bars we already had deepens nothing");
+    assert.equal(p.gap?.bars, 50, "and the hole is still reported, because it is still there");
+    assert.ok(p.nextRetryAt > Date.now(), "it says when to ask again instead of asking now");
+    assert.equal(p.attempts, 1, "the streak counts a page that fetched nothing");
+    assert.match(p.lastError ?? "", /gap/, "with a reason that names the hole");
+    await sleep(60);
+    assert.equal(asked.length, 1, "and the backoff holds the next probe, not the 5ms crawl gap");
+  } finally { c.stop(); }
+});
+
+test("gap: a complete label does not outrank a hole in the candles", () => {
+  const whole = store("reopen-whole", { depthTargets: { "1m": 22 } });
+  whole.remember("BTCUSDT", "1m", liveRun(22));
+  whole.markProgress("BTCUSDT", "1m", { status: "complete" });
+  const holed = store("reopen-holed", { depthTargets: { "1m": 22 } });
+  holed.remember("BTCUSDT", "1m", [...liveRun(12), ...run(10, NOW - 60 * MIN)]);
+  holed.markProgress("BTCUSDT", "1m", { status: "complete" });
+
+  const refuse = async () => { throw new Error("never asked"); };
+  const a = createKlineCrawler({ store: whole, fetchPage: refuse, logger: silentLogger });
+  const b = createKlineCrawler({ store: holed, fetchPage: refuse, logger: silentLogger });
+  try {
+    assert.equal(a.trigger("BTCUSDT", "1m"), false, "deep and unbroken is finished, and stays finished");
+    assert.equal(b.trigger("BTCUSDT", "1m"), true, "the same count with a hole in it is not finished");
+  } finally { a.stop(); b.stop(); }
+});
+
+test("crawl: a blocked venue is waited out without re-reading the cold window", async () => {
+  // The spin this rule exists to stop: while the venue refuses, every pass that
+  // cannot go out used to re-arm at crawl speed, and a window whose bytes are on
+  // disk paid a read and a gunzip each time to discover nothing had changed.
+  const file = mirror("cold-backoff");
+  const seed = createKlinesStore({ file, logger: silentLogger, hotWindows: 1 });
+  seed.remember("BTCUSDT", "1m", liveRun(30));
+  seed.remember("ETHUSDT", "1m", liveRun(30)); // BTC's bytes leave RAM
+  await seed.flush();
+  const s = await createKlinesStore({ file, logger: silentLogger, hotWindows: 1 }).load();
+  assert.equal(s.isLoaded("BTCUSDT", "1m"), false, "the window under test is the cold one");
+
+  let asks = 0;
+  const c = createKlineCrawler({
+    store: s, logger: silentLogger, page: 10, gapMs: 5, backoffMs: 2_000,
+    // What a blocked venue looks like from the crawl: the fetcher fell back to
+    // our own memory, which is not a page and not a reason to ask again now.
+    async fetchPage() { asks += 1; return { data: [], source: "mirror" }; },
+  });
+  try {
+    assert.equal(c.trigger("BTCUSDT", "1m"), true, "the first demand is allowed through");
+    await until(() => s.progress("BTCUSDT", "1m").status === "waiting", 3000, "the first probe to come back");
+    const asked = asks;
+    const reads = s.metrics().reads;
+    assert.equal(c.trigger("BTCUSDT", "1m"), false, "a scheduled retry is not a new demand");
+    await sleep(200);
+    assert.equal(asks, asked, "and nothing more was asked of the venue while it waits");
+    assert.equal(s.metrics().reads, reads, "nor was the cold window read again to find that out");
+  } finally { c.stop(); }
 });

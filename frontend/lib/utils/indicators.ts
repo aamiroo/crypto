@@ -99,3 +99,11 @@ export function bollinger(closes: number[], period = 20, stdDev = 2) {
 export function klineCloses(klines: KlineData[]): number[] {
   return klines.map((k) => parseFloat(k.close));
 }
+
+let seq = 0;
+/** Id for a newly added indicator. `type+period` alone collides the moment the
+ *  user stacks two SMAs of the same length, and a timestamp alone repeats for
+ *  anything created in the same millisecond, so a per-session counter follows it. */
+export function newIndicatorId(type: string, period: number): string {
+  return `${type}${period}-${Date.now().toString(36)}-${++seq}`;
+}

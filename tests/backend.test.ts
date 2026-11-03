@@ -64,8 +64,69 @@ test("instruments: registry lookup is case-insensitive and restrict() defaults u
   assert.equal(inst.source, "override");
 });
 
-test("instruments: the bundled fallback snapshot is self-consistent", () => {
-  assert.ok(fallbackInstruments.length > 100, "fallback list should cover the venue");
+/** Swap only the venue calls, so a registry test cannot reach the network. */
+async function withVenue<T>(reply: (url: string) => unknown, run: () => Promise<T>): Promise<T> {
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (input: unknown) =>
+    String(input).includes("api.bybit.com")
+      ? ({ ok: true, status: 200, json: async () => reply(String(input)) } as unknown as Response)
+      : (prev(input as never) as unknown as Promise<Response>);
+  try { return await run(); } finally { globalThis.fetch = prev; }
+}
+
+const venueList = (symbols: string[]) => ({
+  retCode: 0,
+  result: {
+    list: symbols.map((symbol) => ({
+      symbol, baseCoin: symbol.replace(/USDT$/, ""), quoteCoin: "USDT", status: "Trading",
+      priceFilter: { tickSize: "0.01" }, lotSizeFilter: { basePrecision: "0.001" },
+    })),
+  },
+});
+
+test("instruments: a stale registry resolves an unlisted pair instead of refusing it", async () => {
+  // A pair listed after the cached snapshot was written is not a bad client, and
+  // `/api/klines` must not 404 on the strength of an hours-old file.
+  const inst = new Instruments({ logger: silentLogger, quote: "USDT" });
+  inst.replace([{ symbol: "BTCUSDT", baseCoin: "BTC", priceDecimals: 1, qtyDecimals: 6 }], "cache");
+  assert.equal(inst.usable("NEWUSDT"), false, "a ready registry does not wave unknown pairs through");
+  const asked: string[] = [];
+  const found = await withVenue((url) => { asked.push(url); return venueList(["BTCUSDT", "NEWUSDT"]); },
+    () => inst.resolve("NEWUSDT"));
+  assert.equal(found, true, "the discovery pass landed the pair");
+  assert.equal(inst.usable("NEWUSDT"), true, "and the registry knows it afterwards");
+  assert.equal(asked.length, 1, "one live call, not one per lookup");
+
+  // Still unknown after a real answer is a genuine unknown — and the cooldown
+  // keeps a client retrying a typo from becoming a fetch per request.
+  const miss = await withVenue(() => venueList(["BTCUSDT"]), () => inst.resolve("NOPEUSDT"));
+  assert.equal(miss, false);
+  const second = await withVenue(() => venueList(["BTCUSDT"]), () => inst.resolve("NOPEUSDT"));
+  assert.equal(second, false, "the cooldown answers the second lookup without a fetch");
+});
+
+test("instruments: a registry that is still hydrating refuses nothing", async () => {
+  // Boot ordering: the port is open before the list is, and "not yet looked" is
+  // no authority to reject a well-formed symbol.
+  const inst = new Instruments({ logger: silentLogger, quote: "USDT" });
+  inst.replace([{ symbol: "BTCUSDT", baseCoin: "BTC", priceDecimals: 1, qtyDecimals: 6 }], "cache");
+  inst.ready = false;
+  assert.equal(inst.usable("ETHUSDT"), true, "mid-hydration: serve it and let the fetch fill in");
+  assert.equal(inst.usable("btcusdt"), true, "case normalisation is not lost on the permissive path");
+  inst.ready = true;
+  assert.equal(inst.usable("ETHUSDT"), false, "hydrated: the registry is authoritative again");
+
+  // A registry that never came from the venue (a test fixture, an operator
+  // override) has no wider list to discover into, so `resolve` must not go out.
+  const fixture = new Instruments({ logger: silentLogger, quote: "USDT" });
+  fixture.replace([{ symbol: "BTCUSDT", baseCoin: "BTC", priceDecimals: 1, qtyDecimals: 6 }], "test");
+  let sent = 0;
+  const out = await withVenue(() => { sent += 1; return venueList(["SOMETHINGUSDT"]); }, () => fixture.resolve("SOMETHINGUSDT"));
+  assert.equal(out, false);
+  assert.equal(sent, 0, "no live discovery for a fixture registry");
+});
+
+test("instruments: the bundled fallback snapshot is self-consistent", () => {  assert.ok(fallbackInstruments.length > 100, "fallback list should cover the venue");
   assert.deepEqual(fallbackSymbols, fallbackInstruments.map((i) => i.symbol));
   for (const i of fallbackInstruments.slice(0, 25)) {
     assert.match(i.symbol, /^[A-Z0-9]{3,20}$/);
@@ -107,12 +168,19 @@ test("hub: a late kline subscriber is replayed the cached history", () => {
   hub.subscribe(early, "kline", "BTCUSDT", "1m");
   hub.broadcastKline("BTCUSDT", 1, { interval: "1m", openTime: 1, close: "1" });
   hub.broadcastKline("BTCUSDT", 2, { interval: "1m", openTime: 2, close: "2" });
+  // The venue repeats a forming candle until it closes, so the newest tick is the
+  // truth for that bar and the cache is bounded by bars rather than by ticks.
+  hub.broadcastKline("BTCUSDT", 3, { interval: "1m", openTime: 2, close: "2.5" });
 
   const late = fakeClient();
   hub.register(late);
   hub.subscribe(late, "kline", "BTCUSDT", "1m");
-  assert.deepEqual(types(late), ["kline", "kline"]);
-  assert.deepEqual(late.sent.map((e) => e.seq), [1, 2]);
+  assert.deepEqual(types(late), ["kline_snapshot"], "one collapsed frame, not one replay per cached tick");
+  const snap = late.sent[0];
+  assert.equal(snap.seq, 3, "at the topic's newest seq, so the next live kline is exactly seq+1");
+  assert.equal(snap.data.interval, "1m", "on the frame: that is where the client's gap test reads the interval");
+  assert.deepEqual(snap.data.candles.map((k) => [k.openTime, k.close]), [[1, "1"], [2, "2.5"]],
+    "oldest first, with the forming bar collapsed to its last tick");
   hub.stop();
 });
 
@@ -186,7 +254,7 @@ test("hub: kline history is capped per topic and LRU across topics", () => {
   const hub = new Hub(silentLogger);
   hub.subscribe(fakeClient(), "kline", "BTCUSDT", "1m");
   for (let i = 0; i < 520; i++) hub.broadcastKline("BTCUSDT", i, { interval: "1m", openTime: i, close: "1" });
-  assert.equal(hub.klineHistory.get("kline:BTCUSDT:1m").length, 500);
+  assert.equal(hub.klineHistory.get("kline:BTCUSDT:1m").bars.size, 500, "the replay is capped by bars, not ticks");
 
   for (let i = 0; i < 300; i++) {
     hub.broadcastKline(`SYM${i}USDT`, i, { interval: "1m", openTime: i, close: "1" });
@@ -280,6 +348,7 @@ test("gateway: /api/klines validates every query parameter before touching the v
   const g = await startGateway();
   try {
     const cases = [
+      ["", 400, "BAD_SYMBOL"],
       ["symbol=BTC%20USDT", 400, "BAD_SYMBOL"],
       ["symbol=DOGEUSDT", 404, "UNKNOWN_SYMBOL"],
       ["symbol=BTCUSDT&interval=2m", 400, "BAD_INTERVAL"],

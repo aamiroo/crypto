@@ -32,6 +32,9 @@ export class BybitCollector {
     this._reqSeq = 0;
     this._backoff = 1000;
     this._stopping = false;
+    /** Kline frames dropped for a missing field, so "the venue never spoke" and
+     *  "it spoke unusably" stay two different answers. */
+    this._partial = 0;
   }
 
   /** Start with ticker symbols for ALL pairs (lightweight). */
@@ -275,7 +278,14 @@ export class BybitCollector {
 
   /** Symbol and interval live only in the topic, so both are parsed back out and
    *  the Bybit code mapped to the app's form — the bus subject is what the
-   *  gateway's kline listeners bind to. `confirm` is the only close flag. */
+   *  gateway's kline listeners bind to. `confirm` is the only close flag.
+   *
+   *  A frame missing any OHLCV field is dropped, never filled in. `?? "0"` used to
+   *  turn an absent price into a candle priced at zero, which the mirror accepted
+   *  (it only required `>= 0`) and the browser rejected — so the invented bar took
+   *  the slot of the real one and the hole could never be healed. `start`/`end` are
+   *  taken as the venue sends them; Bybit's `end` is the inclusive last
+   *  millisecond (`start + span - 1`), the same convention the REST path uses. */
   _handleKline(msg) {
     const k = Array.isArray(msg.data) ? msg.data[0] : msg.data;
     if (!k) return;
@@ -284,13 +294,22 @@ export class BybitCollector {
     const symbol = topicParts.length >= 3 ? topicParts[2].toUpperCase() : "";
     const bybitInterval = topicParts.length >= 2 ? topicParts[1] : "1";
     const interval = BYBIT_TO_APP[bybitInterval] || "1m";
+    if (!symbol) return;
+    const fields = [k.start, k.end, k.open, k.high, k.low, k.close, k.volume];
+    if (fields.some((v) => v === undefined || v === null || v === "" || !Number.isFinite(Number(v)))) {
+      this._partial += 1;
+      if (this._partial === 1 || this._partial % 100 === 0) {
+        this.logger.warn("bybit kline frame dropped", { topic, partial: this._partial });
+      }
+      return;
+    }
     bus.pub(subject(this.venue, symbol, `kline.${interval}`), {
       venue: this.venue, symbol,
       interval,
-      openTime: k.start || 0, closeTime: k.end || 0,
-      open: String(k.open ?? "0"), high: String(k.high ?? "0"),
-      low: String(k.low ?? "0"), close: String(k.close ?? "0"),
-      volume: String(k.volume ?? "0"), closed: !!k.confirm,
+      openTime: Number(k.start), closeTime: Number(k.end),
+      open: String(k.open), high: String(k.high),
+      low: String(k.low), close: String(k.close),
+      volume: String(k.volume), closed: !!k.confirm,
     });
   }
 

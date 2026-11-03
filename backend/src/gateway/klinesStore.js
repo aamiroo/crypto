@@ -1,8 +1,15 @@
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync, gunzip, gzip } from "node:zlib";
+import { promisify } from "node:util";
 import path from "node:path";
-import { intervalMs } from "../intervals.js";
+import { intervalMs, slotOf } from "../intervals.js";
+import { isValidTuple, toValidTuple, tuplesFromPage } from "../candleValidation.js";
+
+/** The async halves of the two codecs: a window is a few hundred kB, and reading
+ *  or deflating it on the serving thread is what makes a chart stutter. */
+const gunzipAsync = promisify(gunzip);
+const gzipAsync = promisify(gzip);
 
 /**
  * Candle windows per (symbol, interval): history depth on disk, live edge in RAM.
@@ -24,9 +31,10 @@ import { intervalMs } from "../intervals.js";
  * not the whole history.
  *
  * Only the hot windows keep their candles in RAM (an LRU of `hotWindows`); the
- * rest stay complete on disk and are read back synchronously the moment someone
- * asks for them — a few hundred kB, on a path that was already going to answer
- * from that data.
+ * rest stay complete on disk. A window that went cold is read back *asynchronously*
+ * by `warm()` before the serving path touches it, so a chart never pays disk time
+ * on the event loop; the synchronous read stays only for mutators that must merge
+ * against the window's bytes before anything else happens.
  */
 
 /** Where per-window files live. */
@@ -64,9 +72,6 @@ export function depthTarget(interval) {
 const HOT_WINDOWS = 12;
 /** Windows tracked at all (bytes on disk, progress in RAM). */
 const MAX_WINDOWS = 48;
-/** Older than this the mirror is not worth painting: the gap to "now" would be
- *  wider than the websocket can replay. */
-const MAX_AGE_MS = 3 * 3600e3;
 /** Payload writes are debounced per window: a page records thousands of candles,
  *  and a gzip pass over 10000 of them is real CPU. */
 const PERSIST_DEBOUNCE_MS = 1500;
@@ -79,14 +84,18 @@ const GZIP_LEVEL = 1;
 /** Read errors that mean "the disk did not answer", not "the file is junk". A
  *  window is never overwritten on the strength of one of these. */
 const TRANSIENT_READ_CODES = new Set(["EACCES", "EPERM", "EIO", "EMFILE", "ENFILE", "EBUSY", "ENOMEM", "ENOSPC", "EISDIR", "ENOTDIR"]);
+/** How many slots may be absent at the end of a window before that counts as a
+ *  hole. The bar covering the present moment is still forming and belongs to the
+ *  websocket, so asking the venue for one or two skipped slots on every pass
+ *  would spend a request on bars that arrive by themselves within a minute. */
+const TAIL_GAP_MIN_BARS = 2;
 
-/** Candles are stored as tuples to keep the on-disk mirror small. */
-function toTuple(k) {
-  return [k.openTime, k.open, k.high, k.low, k.close, k.volume];
-}
-
-function isTuple(v) {
-  return Array.isArray(v) && v.length === 6 && Number.isFinite(v[0]) && typeof v[1] === "string";
+/** A stored tuple is re-validated on the way in, so a file written by an older,
+ *  laxer build cannot keep a broken bar alive: `>= 0` prices used to pass here,
+ *  which is how a venue field that never arrived could be read back as a candle
+ *  priced at zero. */
+function isTuple(v, interval) {
+  return isValidTuple(v, interval);
 }
 
 /** Tuples back to the wire shape. `closed` is derived, never stored: a cached bar
@@ -197,6 +206,15 @@ function newWindow(symbol, interval, target) {
     writtenGen: 0,
     writtenSig: null,
     gen: 0,
+    /** Bumped by anything that changes the window's candles. `gap`/`missing` are
+     *  functions of the candles and nothing else, so this is the key their memo is
+     *  validated against (see `scanMeta`). */
+    rev: 0,
+    /** { rev, slot, out } — the last scan result and exactly what it describes. */
+    scan: null,
+    /** The async read in flight for this window, shared by every caller that asks
+     *  for it, so two charts on one cold window cost one disk read. */
+    reading: null,
   };
 }
 
@@ -239,8 +257,10 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
   }
 
   /** Depth is a sliding budget: past the target the oldest bars leave the window
-   *  rather than the window growing without bound. */
+   *  rather than the window growing without bound. Also the one place every
+   *  candle mutation passes, so it is where the window's content revision moves. */
   function capWindow(w) {
+    w.rev += 1;
     if (!w.candles) return;
     if (w.candles.length > w.target) w.candles = w.candles.slice(w.candles.length - w.target);
     recount(w);
@@ -298,14 +318,112 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
     makeRoom();
   }
 
+  /** How many slots are absent between the newest bar and the one still forming
+   *  right now. Counted from the newest bar's own slot onward rather than from an
+   *  epoch-derived "current slot", because a weekly bar sits four days off the
+   *  epoch grid (`intervalOrigin`); an epoch calculation then reports a hole that
+   *  is not there, or misses one that is. */
+  function tailSlots(newestOpenTime, interval) {
+    const ms = intervalMs(interval);
+    if (!(ms > 0) || !Number.isFinite(newestOpenTime)) return 0;
+    // The slot the market is in now belongs to the forming bar, which arrives on
+    // the websocket: only bars strictly between it and the newest bar are missing.
+    const forming = slotOf(Date.now(), interval);
+    return Math.max(0, Math.round((forming - newestOpenTime - ms) / ms));
+  }
+
   /** Whether a window still reaches the present, judged from its newest bar and
    *  not from when the file was written: a daily window legitimately changes once
    *  a day, and a websocket-fed one has to be dropped the moment the stream stops
    *  feeding it. Past that it is history — still worth serving as a backfill page,
-   *  never as the live edge. */
+   *  never as the live edge.
+   *
+   *  Judged as a tail count, not as a wall-clock age: `3 h` is generous beyond use
+   *  for a 1 m window (180 absent bars still read as live) and far too tight for a
+   *  weekly one, whose newest bar is legitimately six days old. A window is the
+   *  live edge only when nothing but the tolerated forming end is missing. */
   function reachesNow(w, newestOpenTime) {
     if (!Number.isFinite(newestOpenTime)) return false;
-    return Date.now() - newestOpenTime <= Math.max(MAX_AGE_MS, 2 * intervalMs(w.interval));
+    return tailSlots(newestOpenTime, w.interval) < TAIL_GAP_MIN_BARS;
+  }
+
+  /** The newest run of slots this window should contain and does not.
+   *
+   *  A mirror develops holes the same way whenever the gateway was down while the
+   *  market kept printing: the bars on either side of the outage are neighbours
+   *  in the array, so a reader sees a continuous chart and cannot tell that days
+   *  of history are absent. The end of the window is the same question — a stream
+   *  that stopped feeding leaves bars between its newest candle and now.
+   *
+   *  Scanned newest-first and returning the first run, because that is the one on
+   *  screen: healing the recent hole before the ancient one is what makes the
+   *  visible chart correct soonest. `null` means the candles held are unbroken
+   *  from their oldest bar up to the present, which is the only state a window
+   *  may be called complete in.
+   */
+  function scanGap(w) {
+    const candles = w.candles;
+    if (!candles || candles.length === 0) return null;
+    const ms = intervalMs(w.interval);
+    if (!(ms > 0)) return null;
+    /** Slots strictly between two openTimes — adjacent bars give zero. */
+    const slots = (a, b) => Math.max(0, Math.floor((b - a - 1) / ms));
+    const newest = candles[candles.length - 1][0];
+    const tail = tailSlots(newest, w.interval);
+    if (tail >= TAIL_GAP_MIN_BARS) {
+      // Both ends stay on the venue's own grid: the crawler asks for the hole,
+      // not for a range shifted onto an epoch boundary that is not a bar slot.
+      return { from: newest + ms, to: newest + tail * ms, bars: tail };
+    }
+    for (let i = candles.length - 1; i > 0; i--) {
+      const missing = slots(candles[i - 1][0], candles[i][0]);
+      if (missing > 0) {
+        return { from: candles[i - 1][0] + ms, to: candles[i][0] - ms, bars: missing };
+      }
+    }
+    return null;
+  }
+
+  /** Everything the window leaves out, not just the newest run.
+   *
+   *  `scanGap` answers "what is fetched next"; it cannot answer "how much of this
+   *  chart is absent", and quoting only its count is what let a 1 m window missing
+   *  7,791 bars in 7 runs report a shortfall of 4. One pass, and only for a window
+   *  whose bytes are already in RAM — the same rule `scanGap` is held to. */
+  function coverage(w) {
+    const candles = w.candles;
+    if (!candles || candles.length === 0) return null;
+    const ms = intervalMs(w.interval);
+    if (!(ms > 0)) return null;
+    let missing = 0;
+    let runs = 0;
+    for (let i = candles.length - 1; i > 0; i--) {
+      const absent = Math.max(0, Math.floor((candles[i][0] - candles[i - 1][0] - 1) / ms));
+      if (absent > 0) { missing += absent; runs += 1; }
+    }
+    const tail = tailSlots(candles[candles.length - 1][0], w.interval);
+    if (tail > 0) { missing += tail; runs += 1; }
+    return { missing, runs, held: candles.length };
+  }
+
+  /** The two full-window scans, memoized.
+   *
+   *  `scanGap` and `coverage` walk every bar of a window — up to ten thousand —
+   *  and both are read on the serving path for every page, so without a memo the
+   *  gateway pays two linear scans per chart request for an answer that only
+   *  changes when the candles do. Their inputs are exactly two things: the bars
+   *  held (`rev`, bumped by every mutation) and the slot the market is in now
+   *  (`slotOf(Date.now())`, the only way either scan sees the clock — the forming
+   *  bar's slot is the end of the tail). A memo keyed on both is therefore not a
+   *  TTL guess: it is stale precisely when the answer would differ, and never
+   *  else. */
+  function scanMeta(w) {
+    if (!w.loaded || !w.candles || w.candles.length === 0) return { gap: null, missing: null };
+    const slot = slotOf(Date.now(), w.interval);
+    if (w.scan && w.scan.rev === w.rev && w.scan.slot === slot) return w.scan.out;
+    const out = { gap: scanGap(w), missing: coverage(w) };
+    w.scan = { rev: w.rev, slot, out };
+    return out;
   }
 
   /** What a window file would have to contain to be worth writing: the depth,
@@ -325,10 +443,8 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       w.cursor, w.status, w.venueFrom, w.venueTo, w.pages].join("|");
   }
 
-  function encode(w) {
-    if (!w.candles) return null;
-    const started = Date.now();
-    const body = {
+  function windowBody(w) {
+    return {
       symbol: w.symbol, interval: w.interval, at: w.at, venue: w.venue, current: w.current,
       bars: w.bars, venueBars: w.venueBars, venueFrom: w.venueFrom, venueTo: w.venueTo,
       cursor: w.cursor, status: w.status, nextRetryAt: w.nextRetryAt,
@@ -336,7 +452,22 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       pages: w.pages, target: w.target,
       candles: w.candles,
     };
-    const buf = gzipSync(Buffer.from(JSON.stringify(body)), { level: GZIP_LEVEL });
+  }
+
+  function encode(w) {
+    if (!w.candles) return null;
+    const started = Date.now();
+    const buf = gzipSync(Buffer.from(JSON.stringify(windowBody(w))), { level: GZIP_LEVEL });
+    io.encodeMs += Date.now() - started;
+    return { buf, gen: ++w.gen };
+  }
+
+  /** The same snapshot deflated off the event loop: what the migration pass uses,
+   *  because it compresses every window of the old mirror in one go. */
+  async function encodeAsync(w) {
+    if (!w.candles) return null;
+    const started = Date.now();
+    const buf = await gzipAsync(Buffer.from(JSON.stringify(windowBody(w))), { level: GZIP_LEVEL });
     io.encodeMs += Date.now() - started;
     return { buf, gen: ++w.gen };
   }
@@ -431,91 +562,162 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
     return true;
   }
 
+  /** Fold a parsed window file into its record.
+   *
+   *  `keepExisting` is what makes an async read safe: the bytes were read while
+   *  the event loop served something else, and anything merged into this window
+   *  in the meantime is newer than the file. History is immutable, so the two are
+   *  merged with the in-memory bars winning a shared slot — an old file must
+   *  never shallow a live window — and the window's own progress fields, which
+   *  only ever move forward while the process is alive, are kept. */
+  function applyBody(w, body, { keepExisting = false } = {}) {
+    if (!body || !Array.isArray(body.candles)) throw new Error("malformed window");
+    const candles = normalizeTuples(body.candles.filter((t) => isTuple(t, w.interval)));
+    const live = keepExisting && w.loaded ? w.candles : null;
+    w.candles = live ? mergeTuples(candles, live) : candles;
+    w.loaded = true;
+    w.bars = w.candles.length;
+    w.at = Number.isFinite(body.at) ? Math.max(body.at, live ? w.at : 0) : w.at;
+    w.venue = body.venue === true || w.venue === true;
+    // The file's own claim about the live edge is only true while its newest
+    // bar still reaches the present; a window read back days later is history
+    // and must not answer a "what is recent" read.
+    w.current = body.current !== false && reachesNow(w, w.candles[w.candles.length - 1]?.[0]);
+    const from = Number.isFinite(body.venueFrom) ? body.venueFrom : null;
+    const to = Number.isFinite(body.venueTo) ? body.venueTo : null;
+    w.venueFrom = live && w.venueFrom !== null ? Math.min(w.venueFrom, from ?? w.venueFrom) : from;
+    w.venueTo = live && w.venueTo !== null ? Math.max(w.venueTo, to ?? w.venueTo) : to;
+    w.venueBars = Number.isFinite(body.venueBars)
+      ? Math.max(body.venueBars, live ? w.venueBars : 0)
+      : (w.venue ? w.bars : 0);
+    const cursor = Number.isFinite(body.cursor) ? body.cursor : null;
+    // A crawl that was mid-page when the process died is not crawling any more;
+    // the cursor it left is exactly where it picks up.
+    const status = typeof body.status === "string" ? body.status : "idle";
+    if (!live) {
+      w.cursor = cursor;
+      w.status = status === "crawling" ? "idle" : status;
+      w.nextRetryAt = Number.isFinite(body.nextRetryAt) ? body.nextRetryAt : 0;
+      w.lastError = typeof body.lastError === "string" ? body.lastError : null;
+      w.attempts = Number.isFinite(body.attempts) ? body.attempts : 0;
+      w.exhaustedAt = Number.isFinite(body.exhaustedAt) ? body.exhaustedAt : 0;
+      w.pages = Number.isFinite(body.pages) ? body.pages : 0;
+    } else {
+      // The live crawl is further along than anything a stale file can say.
+      if (cursor !== null && w.cursor !== null) w.cursor = Math.min(w.cursor, cursor);
+    }
+    // A window file written under a different depth policy keeps its own
+    // target; only a file that never recorded one falls back to the table.
+    w.target = Number.isFinite(body.target) ? body.target : targetFor(w.interval);
+    // A window whose newest bar no longer reaches the present is history, not a
+    // live edge: its depth and cursor are what a restart keeps, but answering
+    // "what is recent" from it would paint a frozen chart.
+    if (!reachesNow(w, w.candles[w.candles.length - 1]?.[0])) w.current = false;
+    w.rev += 1;
+    w.writtenGen = w.gen;
+    w.writtenSig = live ? w.writtenSig : signature(w);
+  }
+
+  /** The bookkeeping both read paths share when the disk did not answer. */
+  function failRead(w, err) {
+    io.failedReads += 1;
+    if (err.code !== "ENOENT") log.warn("klines window unreadable", { key: keyOf(w.symbol, w.interval), err: err.message });
+    // A permission or device error says nothing about the bytes in the file.
+    // Treat the window as still cold and refuse to write it: replacing history
+    // we never read with an empty window would turn one bad read into data loss.
+    if (TRANSIENT_READ_CODES.has(err.code)) {
+      w.loaded = false;
+      w.candles = null;
+      return false;
+    }
+    // Missing or genuinely corrupt: start the window empty rather than fail the
+    // request, and let the next change put a usable file back. The progress
+    // fields we may have loaded from a previous read stay as they were.
+    w.candles = [];
+    w.loaded = true;
+    w.bars = 0;
+    w.rev += 1;
+    w.writtenSig = null;
+    return false;
+  }
+
   /** A corrupt or unreadable window costs that window, never the store. */
   function readWindow(w) {
     const started = Date.now();
     io.reads += 1;
     try {
       const body = JSON.parse(gunzipSync(readFileSync(fileOf(w))).toString("utf8"));
-      if (!body || !Array.isArray(body.candles)) throw new Error("malformed window");
-      const candles = normalizeTuples(body.candles.filter(isTuple));
-      w.candles = candles;
-      w.loaded = true;
-      w.bars = candles.length;
-      w.at = Number.isFinite(body.at) ? body.at : w.at;
-      w.venue = body.venue === true;
-      // The file's own claim about the live edge is only true while its newest
-      // bar still reaches the present; a window read back days later is history
-      // and must not answer a "what is recent" read.
-      w.current = body.current !== false && reachesNow(w, candles[candles.length - 1]?.[0]);
-      w.venueFrom = Number.isFinite(body.venueFrom) ? body.venueFrom : null;
-      w.venueTo = Number.isFinite(body.venueTo) ? body.venueTo : null;
-      w.venueBars = Number.isFinite(body.venueBars) ? body.venueBars : (w.venue ? w.bars : 0);
-      w.cursor = Number.isFinite(body.cursor) ? body.cursor : null;
-      // A crawl that was mid-page when the process died is not crawling any
-      // more; the cursor it left is exactly where it picks up.
-      w.status = typeof body.status === "string" ? body.status : "idle";
-      if (w.status === "crawling") w.status = "idle";
-      w.nextRetryAt = Number.isFinite(body.nextRetryAt) ? body.nextRetryAt : 0;
-      w.lastError = typeof body.lastError === "string" ? body.lastError : null;
-      w.attempts = Number.isFinite(body.attempts) ? body.attempts : 0;
-      w.exhaustedAt = Number.isFinite(body.exhaustedAt) ? body.exhaustedAt : 0;
-      w.pages = Number.isFinite(body.pages) ? body.pages : 0;
-      // A window file written under a different depth policy keeps its own
-      // target; only a file that never recorded one falls back to the table.
-      w.target = Number.isFinite(body.target) ? body.target : targetFor(w.interval);
-      w.writtenGen = w.gen;
-      w.writtenSig = signature(w);
       io.readMs += Date.now() - started;
+      applyBody(w, body);
       return true;
     } catch (err) {
       io.readMs += Date.now() - started;
-      io.failedReads += 1;
-      if (err.code !== "ENOENT") log.warn("klines window unreadable", { key: keyOf(w.symbol, w.interval), err: err.message });
-      // A permission or device error says nothing about the bytes in the file.
-      // Treat the window as still cold and refuse to write it: replacing history
-      // we never read with an empty window would turn one bad read into data loss.
-      if (TRANSIENT_READ_CODES.has(err.code)) {
-        w.loaded = false;
-        w.candles = null;
-        return false;
-      }
-      // Missing or genuinely corrupt: start the window empty rather than fail the
-      // request, and let the next change put a usable file back. The progress
-      // fields we may have loaded from a previous read stay as they were.
-      w.candles = [];
-      w.loaded = true;
-      w.bars = 0;
-      w.writtenSig = null;
-      return false;
+      return failRead(w, err);
     }
+  }
+
+  /** The same read with the disk and the codec off the event loop: what the
+   *  serving path and the boot pass use, so a chart is never painted behind a
+   *  synchronous `readFileSync` + `gunzipSync` of a few hundred kB. */
+  async function readWindowAsync(w) {
+    const started = Date.now();
+    io.reads += 1;
+    let raw;
+    try {
+      raw = await readFile(fileOf(w));
+    } catch (err) {
+      io.readMs += Date.now() - started;
+      return failRead(w, err);
+    }
+    try {
+      const body = JSON.parse((await gunzipAsync(raw)).toString("utf8"));
+      io.readMs += Date.now() - started;
+      applyBody(w, body, { keepExisting: true });
+      return true;
+    } catch (err) {
+      io.readMs += Date.now() - started;
+      return failRead(w, err);
+    }
+  }
+
+  /** One in-flight async read per window, whatever number of callers want it. */
+  function readAsyncOnce(w) {
+    if (w.loaded) return Promise.resolve(true);
+    if (!w.reading) w.reading = readWindowAsync(w).finally(() => { w.reading = null; });
+    return w.reading;
+  }
+
+  /** The record for a window, without touching the disk: the LRU bookkeeping on
+   *  its own, so an async reader can create the record it is about to fill. */
+  function registerWindow(symbol, interval) {
+    const key = keyOf(symbol, interval);
+    let w = windows.get(key);
+    if (w) return w;
+    w = newWindow(symbol, interval, targetFor(interval));
+    windows.set(key, w);
+    while (windows.size > MAX_WINDOWS) {
+      let oldestKey = null;
+      let oldest = Infinity;
+      for (const [k, v] of windows) {
+        // A crawling window is never dropped: it owns an in-flight page.
+        if (v.status === "crawling") continue;
+        if (v.lastTouched < oldest) { oldest = v.lastTouched; oldestKey = k; }
+      }
+      if (!oldestKey) break;
+      // Written before the record is forgotten: the file is what a later
+      // request reads back, and the record itself is only a cache of it.
+      const dropped = windows.get(oldestKey);
+      if (dropped.loaded) evict(dropped);
+      windows.delete(oldestKey);
+    }
+    return w;
   }
 
   /** The window's candles in RAM, read back from disk when it was cold. Every
    *  mutator goes through here so a page never merges against a half-known
    *  window and then writes the missing half away. */
   function openWindow(symbol, interval) {
-    const key = keyOf(symbol, interval);
-    let w = windows.get(key);
-    if (!w) {
-      w = newWindow(symbol, interval, targetFor(interval));
-      windows.set(key, w);
-      while (windows.size > MAX_WINDOWS) {
-        let oldestKey = null;
-        let oldest = Infinity;
-        for (const [k, v] of windows) {
-          // A crawling window is never dropped: it owns an in-flight page.
-          if (v.status === "crawling") continue;
-          if (v.lastTouched < oldest) { oldest = v.lastTouched; oldestKey = k; }
-        }
-        if (!oldestKey) break;
-        // Written before the record is forgotten: the file is what a later
-        // request reads back, and the record itself is only a cache of it.
-        const dropped = windows.get(oldestKey);
-        if (dropped.loaded) evict(dropped);
-        windows.delete(oldestKey);
-      }
-    }
+    const w = registerWindow(symbol, interval);
     if (!w.loaded) readWindow(w);
     touch(w);
     return w;
@@ -558,7 +760,7 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       const [symbol, interval] = key.split("|");
       if (!symbol || !interval || !Array.isArray(v?.candles)) continue;
       const w = newWindow(symbol, interval, targetFor(interval));
-      w.candles = normalizeTuples(v.candles.filter(isTuple));
+      w.candles = normalizeTuples(v.candles.filter((t) => isTuple(t, interval)));
       if (!w.candles.length) continue;
       w.loaded = true;
       w.at = Number.isFinite(v.at) ? v.at : now;
@@ -573,7 +775,7 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       w.status = w.bars >= w.target ? "complete" : "idle";
       const already = await readFile(fileOf(w)).then(() => true, () => false);
       if (already) { failed += 1; continue; } // never shallow a window already on disk
-      const snapshot = encode(w);
+      const snapshot = await encodeAsync(w);
       if (!snapshot) continue;
       try {
         await writeSnapshot(fileOf(w), snapshot.buf);
@@ -601,7 +803,13 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
   return {
     /** Migrate the legacy mirror if it is there, then read the per-window files.
      *  Progress is kept for every window; candle bytes only for the newest
-     *  `hotWindows`, the rest being read back on demand. */
+     *  `hotWindows`, the rest being read back on demand.
+     *
+     *  Every step of this is awaited, never synchronous: it runs *behind* the
+     *  listening port, so a request that arrives halfway through must be served
+     *  while the loop is free, and a window the pass has not reached yet is simply
+     *  a window that answers from the venue. A window an earlier request already
+     *  opened is merged with, never replaced — see `applyBody`. */
     async load() {
       try {
         await mkdir(root, { recursive: true });
@@ -617,42 +825,57 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
         log.warn("klines directory unreadable", { root, err: err.message });
         return this;
       }
-      for (const name of names) {
-        if (!name.endsWith(".json.gz") || name.includes(".tmp")) continue;
+      for (const name of names.filter((n) => n.endsWith(".json.gz") && !n.includes(".tmp"))) {
         const [symbol, interval] = name.replace(".json.gz", "").split("_");
         if (!symbol || !interval) continue;
-        const w = newWindow(symbol, interval, targetFor(interval));
-        windows.set(keyOf(symbol, interval), w);
+        const key = keyOf(symbol, interval);
+        // A request that got here first owns the record; the boot pass only fills
+        // in the metadata it cannot already have.
+        const w = windows.has(key) ? windows.get(key) : newWindow(symbol, interval, targetFor(interval));
+        if (!windows.has(key)) windows.set(key, w);
         try {
           const started = Date.now();
           io.reads += 1;
-          const body = JSON.parse(gunzipSync(readFileSync(path.join(root, name))).toString("utf8"));
+          const raw = await readFile(path.join(root, name));
+          const body = JSON.parse((await gunzipAsync(raw)).toString("utf8"));
           io.readMs += Date.now() - started;
           if (!body || !Array.isArray(body.candles)) throw new Error("malformed window");
-          w.at = Number.isFinite(body.at) ? body.at : 0;
-          w.venue = body.venue === true;
+          // Counted after the filter, because `bars` is what the depth conclusion
+          // is drawn from: rows that are not candles may not fill a window.
+          const kept = body.candles.filter((t) => isTuple(t, interval));
+          const bars = kept.length;
+          // Boot keeps the depth and the crawl state of every window, and the
+          // bytes of none of them: the hot set is chosen below and re-read.
+          w.at = Number.isFinite(body.at) ? Math.max(body.at, w.at) : w.at;
+          w.venue = body.venue === true || w.venue === true;
           w.current = body.current !== false;
-          w.bars = body.candles.length;
-          w.venueFrom = Number.isFinite(body.venueFrom) ? body.venueFrom : null;
-          w.venueTo = Number.isFinite(body.venueTo) ? body.venueTo : null;
+          w.bars = Math.max(bars, w.loaded ? w.bars : 0);
+          w.venueFrom = Number.isFinite(body.venueFrom) ? body.venueFrom : w.venueFrom;
+          w.venueTo = Number.isFinite(body.venueTo) ? body.venueTo : w.venueTo;
           w.venueBars = Number.isFinite(body.venueBars) ? body.venueBars : (w.venue ? w.bars : 0);
-          w.cursor = Number.isFinite(body.cursor) ? body.cursor : null;
-          w.status = typeof body.status === "string" ? body.status : "idle";
-          if (w.status === "crawling") w.status = "idle";
-          w.nextRetryAt = Number.isFinite(body.nextRetryAt) ? body.nextRetryAt : 0;
-          w.lastError = typeof body.lastError === "string" ? body.lastError : null;
-          w.pages = Number.isFinite(body.pages) ? body.pages : 0;
-          w.attempts = Number.isFinite(body.attempts) ? body.attempts : 0;
-          w.exhaustedAt = Number.isFinite(body.exhaustedAt) ? body.exhaustedAt : 0;
+          w.cursor = Number.isFinite(body.cursor)
+            ? (w.cursor === null ? body.cursor : Math.min(w.cursor, body.cursor)) : w.cursor;
+          if (!w.loaded) {
+            const status = typeof body.status === "string" ? body.status : "idle";
+            w.status = status === "crawling" ? "idle" : status;
+            w.nextRetryAt = Number.isFinite(body.nextRetryAt) ? body.nextRetryAt : 0;
+            w.lastError = typeof body.lastError === "string" ? body.lastError : null;
+            w.pages = Number.isFinite(body.pages) ? body.pages : 0;
+            w.attempts = Number.isFinite(body.attempts) ? body.attempts : 0;
+            w.exhaustedAt = Number.isFinite(body.exhaustedAt) ? body.exhaustedAt : 0;
+          } else {
+            w.pages = Number.isFinite(body.pages) ? Math.max(body.pages, w.pages) : w.pages;
+          }
           w.target = Number.isFinite(body.target) ? body.target : targetFor(interval);
           // A window whose newest bar no longer reaches the present is history,
           // not a live edge: its depth, cursor and status are exactly what a
           // restart should keep, but answering "what is recent" from it would
           // paint a frozen chart.
-          if (!reachesNow(w, body.candles[body.candles.length - 1]?.[0])) w.current = false;
+          if (!reachesNow(w, kept[kept.length - 1]?.[0])) w.current = false;
+          w.rev += 1;
         } catch (err) {
           io.failedReads += 1;
-          windows.delete(keyOf(symbol, interval));
+          if (!w.loaded) windows.delete(key);
           log.warn("klines window skipped", { file: name, err: err.message });
         }
       }
@@ -661,7 +884,9 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       // stay complete on disk and are read back the moment someone asks.
       const byAge = [...windows.values()].sort((a, b) => a.at - b.at);
       for (const w of byAge) w.lastTouched = ++seq;
-      for (const w of byAge.slice(-cap)) readWindow(w);
+      for (const w of byAge.slice(-cap)) {
+        if (!w.loaded) await readAsyncOnce(w);
+      }
       makeRoom();
       if (windows.size) log.info("klines windows restored", { windows: windows.size, hot: this.hotCount(), root: path.basename(root) });
       return this;
@@ -676,12 +901,19 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       if (!Array.isArray(data) || data.length === 0) return;
       const w = openWindow(symbol, interval);
       if (!w.loaded) return; // disk refused this window: merging would shallow it
-      const incoming = normalizeTuples(data.map(toTuple));
+      const { tuples, rejected } = tuplesFromPage(data, interval);
+      if (rejected) log.warn("klines page rows rejected", { symbol, interval, rejected, of: data.length });
+      if (tuples.length === 0) return;
+      const incoming = normalizeTuples(tuples);
       noteVenue(w, incoming);
       w.candles = mergeTuples(w.candles ?? [], incoming);
       w.at = Date.now();
-      w.current = true;
       capWindow(w);
+      // The live edge is earned by the bars themselves, not by the fact that a
+      // venue page just arrived: a page whose newest candle is days old — which is
+      // what a window looks like when the venue serves history while the stream is
+      // down — must not be painted as the present.
+      w.current = reachesNow(w, w.candles[w.candles.length - 1]?.[0]);
       if (w.cursor === null || (w.candles[0]?.[0] ?? 0) - 1 < w.cursor) w.cursor = (w.candles[0]?.[0] ?? 0) - 1;
       queuePersist(w);
     },
@@ -689,20 +921,36 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
     /** Fold a page of *older* candles in, so scroll-back is answered from the
      *  mirror instead of re-fetching a page the terminal already had.
      *
-     *  The deepening path, and it deliberately does not make the window
-     *  `current`: bars that end months ago are history, not the live edge, and a
-     *  "what is recent" read must not quietly return stale ones. */
+     *  The deepening path, and it deliberately does not claim the live edge: bars
+     *  that end months ago are history, not the present, and a "what is recent"
+     *  read must not quietly return stale ones. It does restore the claim when a
+     *  merged page really does reach now, which is what a healed tail looks like.
+     *
+     *  Returns how many slots were actually new to the window, so the caller can
+     *  tell a page that filled a hole from one that only re-served bars already
+     *  held — the difference between progress and a range worth retrying. */
     rememberOlder(symbol, interval, data) {
-      if (!Array.isArray(data) || data.length === 0) return;
+      if (!Array.isArray(data) || data.length === 0) return 0;
       const w = openWindow(symbol, interval);
-      if (!w.loaded) return;
-      const incoming = normalizeTuples(data.map(toTuple));
+      if (!w.loaded) return 0;
+      const { tuples, rejected } = tuplesFromPage(data, interval);
+      if (rejected) log.warn("klines page rows rejected", { symbol, interval, rejected, of: data.length });
+      if (tuples.length === 0) return 0;
+      const incoming = normalizeTuples(tuples);
+      const held = w.candles ?? [];
+      // Measured before the depth cap: bars that push the oldest out of a full
+      // window still arrived, and a heal has to be able to tell that from the
+      // venue serving a range the window already had.
+      const merged = mergeTuples(held, incoming);
+      const added = Math.max(0, merged.length - held.length);
       noteVenue(w, incoming);
-      w.candles = mergeTuples(w.candles ?? [], incoming);
+      w.candles = merged;
       w.at = Date.now();
       capWindow(w);
       w.cursor = (w.candles[0]?.[0] ?? 0) - 1;
+      if (reachesNow(w, w.candles[w.candles.length - 1]?.[0])) w.current = true;
       queuePersist(w);
+      return added;
     },
 
     /** Fold one streamed candle into its window.
@@ -713,15 +961,12 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
      *  difference between "the chart is current" and "we have history" has to
      *  survive the tail arriving. */
     append(symbol, interval, k) {
-      const openTime = Number(k?.openTime);
-      if (!Number.isFinite(openTime) || openTime <= 0) return false;
-      const num = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? String(v) : null);
-      const ohlcv = [num(k.open), num(k.high), num(k.low), num(k.close), num(k.volume)];
-      if (ohlcv.some((v) => v === null)) return false;
+      const tuple = toValidTuple(k, interval);
+      if (!tuple) return false;
+      const openTime = tuple[0];
       const w = openWindow(symbol, interval);
       if (!w.loaded) return false;
       const candles = w.candles ?? [];
-      const tuple = [openTime, ...ohlcv];
       const last = candles[candles.length - 1];
       const grew = !last || last[0] < openTime;
       if (grew) candles.push(tuple);
@@ -735,7 +980,10 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       }
       w.candles = candles;
       w.at = Date.now();
-      w.current = true;
+      // A stream tick only makes the window the live edge if the bar it carries
+      // actually covers the present. A replayed or backfilled tick landing days
+      // behind must not relabel a history window as current.
+      w.current = reachesNow(w, candles[candles.length - 1]?.[0]);
       const before = w.bars;
       capWindow(w);
       // A tick that only rewrites the forming candle changes nothing on disk
@@ -749,18 +997,28 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
      *  real exchange history, and where/why the crawl stopped. `bars` is what we
      *  hold, `venueBars` what the venue actually served, `status` what history
      *  says — three different questions, and a client has to be able to tell
-     *  a short window from an ended one. */
+     *  a short window from an ended one.
+     *
+     *  `gap` is only read for a window whose bytes are already in RAM: it is the
+     *  question "is what we hold unbroken", and a request path must never pay a
+     *  disk read to answer it. `null` therefore means either "unbroken" or "not
+     *  looked" — `loaded` tells the two apart, and a caller that may go to disk
+     *  (the crawl) calls `warm()` first and re-reads the progress after it. */
     progress(symbol, interval) {
       const w = windows.get(keyOf(symbol, interval));
       if (!w) {
         return { target: targetFor(interval), bars: 0, venueBars: 0, status: "idle",
           cursor: null, nextRetryAt: 0, lastError: null, attempts: 0, exhaustedAt: 0,
-          pages: 0, venue: false, current: false, loaded: false, file: fileName(symbol, interval) };
+          pages: 0, venue: false, current: false, loaded: false, gap: null,
+          file: fileName(symbol, interval) };
       }
+      const scan = scanMeta(w);
       return { target: w.target, bars: w.bars, venueBars: w.venueBars, status: w.status,
         cursor: w.cursor, nextRetryAt: w.nextRetryAt, lastError: w.lastError,
         attempts: w.attempts, exhaustedAt: w.exhaustedAt, pages: w.pages,
         venue: w.venue, current: w.current, loaded: w.loaded,
+        gap: scan.gap,
+        missing: scan.missing,
         venueFrom: w.venueFrom, venueTo: w.venueTo, file: fileName(w.symbol, w.interval) };
     },
 
@@ -785,11 +1043,22 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
       return windows.get(keyOf(symbol, interval))?.loaded === true;
     },
 
-    /** Read one window's bytes now, so a request path never pays disk time while
-     *  a client waits. Cheap for a window already hot. */
+    /** Read one window's bytes now, asynchronously, so a request path never pays
+     *  disk time while a client waits. Cheap for a window already hot, shared
+     *  between callers wanting the same one, and safe against a merge that lands
+     *  mid-read: what the file holds is joined under what the window holds. */
     async warm(symbol, interval) {
-      const w = openWindow(symbol, interval);
+      const w = registerWindow(symbol, interval);
+      if (w.loaded) { touch(w); return true; }
+      const ok = await readAsyncOnce(w);
+      if (ok) touch(w);
       return w.loaded;
+    },
+
+    /** Same question, without the read: is this window's data on demand? */
+    isWarming(symbol, interval) {
+      const w = windows.get(keyOf(symbol, interval));
+      return !!w && !!w.reading;
     },
 
     /** The newest `limit` candles of that window, or null when we never had one.

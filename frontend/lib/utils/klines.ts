@@ -32,6 +32,23 @@ export const TIMEFRAME_SPAN_MS: Record<Timeframe, number> = {
   "1w": 604_800_000,
 };
 
+/** Slot origin per timeframe, as an offset from the unix epoch. Weekly candles
+ *  open on Monday 00:00 UTC while the epoch is a Thursday, so a real weekly bar
+ *  carries `openTime % 604800000 === 345600000`: counting slots from the epoch
+ *  puts the "current" weekly slot four days early and can read a genuinely absent
+ *  week as present. Matches the backend's `intervalOrigin`. */
+const TIMEFRAME_ORIGIN_MS: Record<Timeframe, number> = {
+  "1m": 0, "3m": 0, "5m": 0, "15m": 0, "30m": 0, "1h": 0, "4h": 0, "1d": 0,
+  "1w": 3456e5,
+};
+
+/** Which candle slot a timestamp falls in, on that timeframe's own grid. */
+export function slotOf(time: number, interval: Timeframe): number {
+  const span = TIMEFRAME_SPAN_MS[interval] ?? 60_000;
+  const origin = TIMEFRAME_ORIGIN_MS[interval] ?? 0;
+  return Math.floor((time - origin) / span) * span + origin;
+}
+
 const MIN_OPEN_TIME = 946684800000; // 2000-01-01
 const MAX_OPEN_TIME = 4102444800000; // 2100-01-01
 
@@ -46,6 +63,43 @@ export const RECENT_TAIL_MS = 120_000;
 export function isCurrentBar(k: KlineData): boolean {
   const span = TIMEFRAME_SPAN_MS[k.interval as Timeframe] ?? 60_000;
   return k.openTime + span > Date.now() - RECENT_TAIL_MS;
+}
+
+/** What this series leaves out: bars that should be between the candles on hand,
+ *  counted from the spacing of the candles themselves.
+ *
+ *  A chart with a hole in it does not look like one. The time scale is drawn from
+ *  the data it is given, so the two candles either side of an outage sit next to
+ *  each other and the price line simply jumps — a reader sees a market that moved
+ *  fast, not days of history that never arrived. The same face is what a frozen
+ *  feed shows: the newest candle stops covering the present, but the axis keeps
+ *  ending there as if it were now.
+ *
+ *  `bars` is both runs together (interior holes plus the tail up to this moment),
+ *  and `lagMs` is how far the newest candle trails the minute the market is in
+ *  now, which is what a badge has to say when the tail itself is the gap. One
+ *  absent bar is not reported: the bar covering the present moment is still
+ *  forming, and the difference between "not delivered yet" and "never arrived"
+ *  is not something the series can know.
+ */
+export function missingHistory(klines: KlineData[], interval: Timeframe): { bars: number; lagMs: number } {
+  const span = TIMEFRAME_SPAN_MS[interval] ?? 60_000;
+  const last = klines[klines.length - 1];
+  if (!last) return { bars: 0, lagMs: 0 };
+  // Counted from the slot the market is in right now, on that timeframe's own
+  // grid: the same window then reports the same absence however late in the
+  // minute the chart happened to ask, and a weekly series is measured against a
+  // Monday instead of against a Thursday four days away from any real candle.
+  const forming = slotOf(Date.now(), interval);
+  const lagMs = Math.max(0, forming - last.openTime);
+  // The bar covering the present is still forming, so it is not counted as
+  // missing — the same tolerance the gateway's own tail uses.
+  let bars = Math.max(0, Math.round((lagMs - span) / span));
+  for (let i = klines.length - 1; i > 0; i--) {
+    const absent = klines[i]!.openTime - klines[i - 1]!.openTime - span;
+    if (absent > 0) bars += Math.floor(absent / span);
+  }
+  return { bars, lagMs };
 }
 
 /** Unique key for a (symbol, interval) kline window. */
@@ -252,21 +306,34 @@ export function mergeKlines(
   return incoming ? mergeOne(base, incoming, protect) : base;
 }
 
-/** Raw incoming kline (WS or REST row) merged into an existing array. */
+/** Raw incoming kline (WS or REST row) merged into an existing array.
+ *
+ *  A bar the series already holds as *closed* outranks one still forming: the
+ *  stream can hand over a late or replayed tick for a candle that has since
+ *  finalised, and letting it rewrite that bar would rewind a settled price with
+ *  a partial one. Everything else — a correction to a closed bar, a new slot, a
+ *  fresh tick on the forming one — still takes the incoming values. */
 export function mergeRawKline(base: KlineData[], raw: unknown, fallbackInterval?: string): KlineData[] {
   const k = normalizeKline(raw, fallbackInterval);
   if (!k) return base;
-  return mergeOne(base, k);
+  return mergeOne(base, k, (b, n) => b.closed && !n.closed);
 }
 
 // ── chart mapping ────────────────────────────────────────────────────────
 // Input is assumed to be validated (normalizeKlines/mergeKlines guarantee
-// that for anything that reaches the store); mappings are index-aligned with
-// the source array so incremental (tail) updates can rely on shared indexes.
+// that for anything that reaches the store). The candle series is *not*
+// index-aligned with the source array: a hole in the history is painted with
+// empty slots, so a chart showing 09:00 next to 12:00 cannot be read as 09:00
+// next to 09:01. Anything that needs the candle's own position looks it up by
+// time (see `buildTimeIndex` and the store's order map), never by array index.
 
 export interface CandleBar { time: Time; open: number; high: number; low: number; close: number; }
 export interface LineBar { time: Time; value: number; }
 export interface VolumeBar { time: Time; value: number; color: string; }
+/** A slot the market printed nothing for. It carries a time and no value, so
+ *  it reserves room on the axis without becoming a candle. */
+export interface WhitespaceBar { time: Time; }
+export type ChartPoint = CandleBar | LineBar | VolumeBar | WhitespaceBar;
 
 /** The store keeps ms (venue-native); lightweight-charts is fed UTCTimestamp
  *  seconds, so every series mapping and every coordinate lookup goes through
@@ -275,29 +342,106 @@ function toBarTime(k: KlineData): Time {
   return Math.floor(k.openTime / 1000) as Time;
 }
 
-/** Map klines to candlestick bars. */
-export function toCandleBars(klines: KlineData[]): CandleBar[] {
-  return klines.map((k) => ({
-    time: toBarTime(k),
-    open: Number(k.open),
-    high: Number(k.high),
-    low: Number(k.low),
-    close: Number(k.close),
-  }));
+/** Empty candle slots between two neighbours — zero when they are adjacent.
+ *  Counted on the interval's own duration, so a missing hour on 1h is one hole
+ *  and a missing week on 1w is one hole. */
+export function gapHoles(prev: KlineData, next: KlineData): number {
+  const span = TIMEFRAME_SPAN_MS[prev.interval as Timeframe] ?? 60_000;
+  return Math.max(0, Math.floor((next.openTime - prev.openTime - span) / span));
+}
+
+/** Ceiling on the empty slots a window may inject. A mirror that lost a month
+ *  of 1m bars would otherwise hand the chart 40,000 points to lay out for a
+ *  thousand candles; past the cap the remaining holes stay reported by the
+ *  badge rather than drawn. */
+export const MAX_GAP_SLOTS = 20_000;
+
+/** Walk a window in axis order, calling `at` once per position: with the candle
+ *  for a bar the venue served, and with null for every slot it did not. An empty
+ *  slot carries the timestamp of the bar that is missing, which is the whole
+ *  point — the axis reserves the room the history never arrived for. */
+function forEachPoint(klines: KlineData[], at: (time: Time, k: KlineData | null) => void): void {
+  let budget = MAX_GAP_SLOTS;
+  for (let i = 0; i < klines.length; i++) {
+    const k = klines[i]!;
+    if (i > 0 && budget > 0) {
+      const prev = klines[i - 1]!;
+      const span = TIMEFRAME_SPAN_MS[prev.interval as Timeframe] ?? 60_000;
+      const holes = Math.min(gapHoles(prev, k), budget);
+      for (let j = 1; j <= holes; j++) at(Math.floor((prev.openTime + j * span) / 1000) as Time, null);
+      budget -= holes;
+    }
+    at(toBarTime(k), k);
+  }
+}
+
+/** How many axis positions the window occupies — what a logical range is
+ *  measured in, which is not the same as how many candles it holds. */
+export function slotCount(klines: KlineData[]): number {
+  let n = 0;
+  forEachPoint(klines, () => { n += 1; });
+  return n;
+}
+
+/** Map klines to candlestick bars, with whitespace over the missing slots. */
+export function toCandleBars(klines: KlineData[]): (CandleBar | WhitespaceBar)[] {
+  const out: (CandleBar | WhitespaceBar)[] = [];
+  forEachPoint(klines, (time, k) => {
+    if (!k) { out.push({ time }); return; }
+    out.push({
+      time,
+      open: Number(k.open),
+      high: Number(k.high),
+      low: Number(k.low),
+      close: Number(k.close),
+    });
+  });
+  return out;
 }
 
 /** Map klines to line/area bars (close price). */
-export function toLineBars(klines: KlineData[]): LineBar[] {
-  return klines.map((k) => ({ time: toBarTime(k), value: Number(k.close) }));
+export function toLineBars(klines: KlineData[]): (LineBar | WhitespaceBar)[] {
+  const out: (LineBar | WhitespaceBar)[] = [];
+  forEachPoint(klines, (time, k) => {
+    if (!k) { out.push({ time }); return; }
+    out.push({ time, value: Number(k.close) });
+  });
+  return out;
 }
 
 /** Map klines to volume histogram bars. */
-export function toVolumeBars(klines: KlineData[], upColor: string, downColor: string): VolumeBar[] {
-  return klines.map((k) => ({
-    time: toBarTime(k),
-    value: Number(k.volume),
-    color: Number(k.close) >= Number(k.open) ? upColor : downColor,
-  }));
+export function toVolumeBars(klines: KlineData[], upColor: string, downColor: string): (VolumeBar | WhitespaceBar)[] {
+  const out: (VolumeBar | WhitespaceBar)[] = [];
+  forEachPoint(klines, (time, k) => {
+    if (!k) { out.push({ time }); return; }
+    out.push({ time, value: Number(k.volume), color: Number(k.close) >= Number(k.open) ? upColor : downColor });
+  });
+  return out;
+}
+
+/**
+ * Series data for a value computed once per candle — an indicator line, or one
+ * leg of a histogram. `values` is index-aligned with `klines` (that is what
+ * `sma(closes)` returns), and the output keeps the axis aligned with the candles
+ * by carrying whitespace over the slots the venue never served.
+ *
+ * Without that, a line joins the two candles either side of an outage into one
+ * straight segment and the overlay claims a continuous history the series does
+ * not have — while the candles under it correctly show the hole.
+ *
+ * A warm-up slot (`null` for the first `period - 1` bars of an SMA) is whitespace
+ * too: it reserves the position the indicator has not reached yet instead of
+ * letting the line start late in a way the axis cannot see.
+ */
+export function toIndicatorBars(klines: KlineData[], values: (number | null)[]): (LineBar | WhitespaceBar)[] {
+  const out: (LineBar | WhitespaceBar)[] = [];
+  let i = 0;
+  forEachPoint(klines, (time, k) => {
+    const v = k ? values[i++] : null;
+    if (v == null || !Number.isFinite(v)) { out.push({ time }); return; }
+    out.push({ time, value: v });
+  });
+  return out;
 }
 
 /** Lookup table from chart time (seconds) back to the source kline. */
@@ -380,13 +524,22 @@ export const SWITCH_RIGHT_PAD = 10;
 
 /**
  * Logical (index-based) range to show after a timeframe change: newest bars
- *  right-aligned, at most SWITCH_VISIBLE_BARS of them. `from` is clamped at 0
- *  because a short window has nothing to the left to show.
+ *  right-aligned, at most SWITCH_VISIBLE_BARS *candles* of them. The axis counts
+ *  the empty slots between candles too, so the walk back from the newest bar
+ *  pays for the holes it crosses — otherwise a window with an outage in its
+ *  recent past would open on 120 slots of which a handful are candles, which is
+ *  exactly the "chart that failed to load" this re-fit exists to prevent.
+ *  `from` is clamped at 0 because a short window has nothing to the left.
  */
-export function switchVisibleRange(count: number): { from: number; to: number } {
-  if (count <= 0) return { from: 0, to: SWITCH_RIGHT_PAD };
-  return {
-    from: Math.max(0, count - SWITCH_VISIBLE_BARS),
-    to: count + SWITCH_RIGHT_PAD,
-  };
+export function switchVisibleRange(klines: KlineData[]): { from: number; to: number } {
+  const total = slotCount(klines);
+  if (total === 0) return { from: 0, to: SWITCH_RIGHT_PAD };
+  let candles = 1;
+  let slots = 1;
+  while (candles < SWITCH_VISIBLE_BARS && klines.length - candles > 0) {
+    const i = klines.length - candles;
+    slots += Math.min(gapHoles(klines[i - 1]!, klines[i]!), MAX_GAP_SLOTS) + 1;
+    candles += 1;
+  }
+  return { from: Math.max(0, total - slots), to: total + SWITCH_RIGHT_PAD };
 }

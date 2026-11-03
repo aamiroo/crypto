@@ -1,11 +1,15 @@
 import http from "node:http";
-import { gzipSync } from "node:zlib";
+import { gzipSync, gzip } from "node:zlib";
+import { promisify } from "node:util";
 import { WebSocketServer } from "ws";
 import { Hub } from "./hub.js";
 import { INTERVALS, intervalMs } from "../intervals.js";
+import { toValidTuple } from "../candleValidation.js";
 import { createKlinesStore } from "./klinesStore.js";
 import { createKlineCrawler } from "./klineCrawler.js";
 import { bus, subject } from "../bus.js";
+
+const gzipAsync = promisify(gzip);
 
 const WS_PATH = "/ws";
 const BYBIT_REST = process.env.BYBIT_REST || "https://api.bybit.com";
@@ -24,42 +28,84 @@ const APP_TO_BYBIT = {
   "1h": "60", "4h": "240", "1d": "D", "1w": "W",
 };
 
-/** Every REST reply goes through here, so the CORS headers are never forgotten. */
-function cors(res, status, body) {
+/** Every REST reply goes through here, so the CORS headers are never forgotten.
+ *  `text` is what the caller already serialised: a body is stringified once, not
+ *  once per encoding it might be sent in. */
+function cors(res, status, body, text) {
   res.writeHead(status, { "Content-Type": "application/json", Vary: "Accept-Encoding", ...CORS });
-  res.end(JSON.stringify(body));
+  res.end(text ?? JSON.stringify(body));
 }
 
 /** Bodies below this are not worth a compression pass: a kline page is ~170 KB
  *  of repeated field names, an error envelope is ~30 bytes. */
 const GZIP_MIN_BYTES = 1024;
+/** Above this the deflate goes to the thread pool instead of the event loop:
+ *  a full page is the biggest thing the terminal sends, and compressing it on
+ *  the loop is CPU taken from every other chart waiting to be painted. */
+const GZIP_ASYNC_BYTES = 32 * 1024;
+/** How many already-compressed payloads are kept. At ~30 KB a page this is a
+ *  few hundred kB for the windows a client is actually looking at, and the LRU
+ *  is what stops a scroll through the whole market from growing it. */
+const GZIP_CACHE_MAX = 24;
+
+/** Response payloads that have already been deflated, keyed by what the caller
+ *  says identifies them (see `respond`). The key is only a hint: an entry is
+ *  reused only after the serialised body is compared byte for byte, so a stale
+ *  or colliding key can cost a compression pass but can never send the wrong
+ *  page. */
+const gzipCache = new Map();
+
+function gzipCachePut(key, text, buf) {
+  if (!key) return;
+  gzipCache.set(key, { text, buf });
+  while (gzipCache.size > GZIP_CACHE_MAX) gzipCache.delete(gzipCache.keys().next().value);
+}
 
 /** The one place a response is compressed, so a body can never be gzipped
  *  twice. Level 1 is deliberate: on a full 1000-candle page it gives 29 KB
  *  against 24 KB at level 6, for 1.3 ms instead of 2.3 ms — on the path that
- *  answers the chart. */
-function respond(req, res, status, body) {
+ *  answers the chart. A repeated read of the same window (the 2 s cache, a
+ *  second client, a browser retry) must not pay even that 1.3 ms: the deflated
+ *  body is kept per response identity and reused while the bytes match. */
+async function respond(req, res, status, body, cacheKey) {
   const text = JSON.stringify(body);
   const enc = String(req.headers["accept-encoding"] ?? "");
-  if (text.length >= GZIP_MIN_BYTES && /\bgzip\b/i.test(enc)) {
-    const gz = gzipSync(Buffer.from(text), { level: 1 });
-    res.writeHead(status, {
-      "Content-Type": "application/json",
-      "Content-Encoding": "gzip",
-      "Content-Length": String(gz.length),
-      Vary: "Accept-Encoding",
-      ...CORS,
-    });
-    res.end(gz);
+  if (text.length < GZIP_MIN_BYTES || !/\bgzip\b/i.test(enc)) {
+    cors(res, status, body, text);
     return;
   }
-  cors(res, status, body);
+  const hit = cacheKey ? gzipCache.get(cacheKey) : null;
+  if (hit && hit.text === text) {
+    // Refresh the LRU position of a page that keeps being asked for.
+    gzipCache.delete(cacheKey);
+    gzipCache.set(cacheKey, hit);
+    sendGzipped(res, status, hit.buf);
+    return;
+  }
+  const gz = text.length >= GZIP_ASYNC_BYTES
+    ? await gzipAsync(Buffer.from(text), { level: 1 })
+    : gzipSync(Buffer.from(text), { level: 1 });
+  gzipCachePut(cacheKey, text, gz);
+  sendGzipped(res, status, gz);
+}
+
+function sendGzipped(res, status, gz) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Content-Encoding": "gzip",
+    "Content-Length": String(gz.length),
+    Vary: "Accept-Encoding",
+    ...CORS,
+  });
+  res.end(gz);
 }
 
 /** Reject anything that is not a well-formed instrument id before it reaches
- *  the exchange URL or the bus. */
-function parseSymbol(raw, fallback) {
-  const s = String(raw ?? fallback ?? "").trim().toUpperCase();
+ *  the exchange URL or the bus. There is no default: a request that does not say
+ *  which pair it wants is a broken client, and quietly answering it with another
+ *  symbol's candles is how a chart ends up showing BTC under an ETH header. */
+function parseSymbol(raw) {
+  const s = String(raw ?? "").trim().toUpperCase();
   return SYMBOL_RE.test(s) ? s : null;
 }
 
@@ -102,11 +148,9 @@ const KLINES_BUDGET_MS = 2500;
 const KLINES_WINDOW_COOL_MS = 20000;
 const KLINES_WINDOW_COOL_MAX_MS = 300000;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 /**
  * The `/api/klines` upstream path: request de-duplication, a tiny cache and a
- * serialized, budget-bounded retry queue.
+ * rate-limited, budget-bounded retry queue with two priorities.
  *
  * Bybit punishes concurrent/rapid REST bursts with HTTP 403, while the client
  * legitimately fires several kline requests at once (remounts, timeframe
@@ -120,18 +164,44 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * is both safe and useful, including right after a restart.
  *
  * `background` marks the probes nobody is waiting on (the refresh tick, the
- * selection pre-warm, the revalidation behind a mirror answer). Those are the
- * ones that pile up while the venue refuses us, so they are the ones the
- * cool-offs silence.
+ * selection pre-warm, the crawl, the revalidation behind a mirror answer). Those
+ * are the ones that pile up while the venue refuses us, so they are the ones the
+ * cool-offs silence — and the ones an interactive request overtakes in the lane.
  */
 function createKlinesFetcher({ store, logger }) {
   const cache = new Map(); // key -> { at, data }
   const inflight = new Map(); // key -> Promise
   const windowCool = new Map(); // "SYM|iv" -> { until, delay }
-  let tail = Promise.resolve(); // serializes outbound Bybit requests
   let lastOut = 0;
   let circuitUntil = 0;
   let circuitErr = null; // why the cool-off was opened, for the first request inside it
+
+  /* ── the lane: one outbound slot, two queues ─────────────────────────
+   * Exactly one request may be in flight to Bybit at a time: its REST burst
+   * protection is a concurrency limit as much as a rate limit, and the
+   * cool-off/backoff behaviour below only makes sense against a single outbound
+   * stream. What starved clients was not the slot, it is that the slot used to
+   * be handed to a whole *probe* — every retry, every cool-off sleep, every
+   * crawl page — on one promise chain. A 1 m window is ten crawl pages at
+   * 750 ms, so a chart opening a different pair queued behind ~9 s of work it
+   * had no interest in.
+   *
+   * Now the slot is granted per attempt, and two queues feed it:
+   *   hi — a client is waiting on the answer
+   *   bg — crawl pages, the refresh tick, the selection pre-warm, and the
+   *        revalidation behind an already-served mirror page
+   * The head of `hi` is picked first whenever the slot frees, so a client jumps
+   * ahead of everything queued behind it; background work additionally waits
+   * out the full minimum spacing after *any* send, so it can never crowd a
+   * client out either. Waits happen in the queue, never while holding the slot:
+   * a cool-off is not a reason for the lane to be busy for 8 s. */
+  const hiQueue = [];
+  const bgQueue = [];
+  let slot = null;        // the item currently holding the outbound slot
+  let laneTimer = null;   // armed to re-pump once the earliest reason clears
+  let laneWake = 0;       // when that timer fires
+  let closed = false;     // the gateway is shutting its lane down
+  const lane = { hi: 0, bg: 0, yielded: 0, expired: 0 };
 
   // Read per gateway, like the refresh interval: an operator (or a test) has to
   // be able to watch the recovery path without waiting minutes for it.
@@ -164,23 +234,116 @@ function createKlinesFetcher({ store, logger }) {
     return circuitUntil > Date.now();
   }
 
-  function enqueue(task) {
-    const run = tail.then(task, task);
-    tail = run.then(() => {}, () => {});
-    return run;
+  /** How long the head item still may not go out, or null when it must stop
+   *  waiting because its own budget would run out first. */
+  function laneDelay(item, now) {
+    const left = item.deadline - now;
+    if (left <= 0) return null;
+    let wait = 0;
+    const cool = circuitUntil - now;
+    if (cool > 0) {
+      // A ban the item would still be sitting in when it ran out of budget is a
+      // ban it should not start waiting for: answer from the mirror instead.
+      if (cool >= left) return null;
+      wait = cool;
+    }
+    // Venue-friendly spacing, unchanged: two sends never closer than this. It is
+    // measured from the last send of either lane, which is also what makes a
+    // background page yield after a client's request.
+    const since = now - lastOut;
+    if (since < KLINES_MIN_SPACING_MS) wait = Math.max(wait, KLINES_MIN_SPACING_MS - since);
+    return wait;
   }
 
-  /** Wait for the shared outbound slot: the cool-off first, then the minimum
-   *  spacing between two Bybit calls. False when the cool-off outlasts what is
-   *  left of the budget, i.e. stop trying rather than overrun or re-probe. */
-  async function pause(budgetLeftMs) {
-    const coolOff = circuitUntil - Date.now();
-    if (coolOff >= budgetLeftMs) return false;
-    if (coolOff > 0) await sleep(coolOff);
-    const since = Date.now() - lastOut;
-    if (since < KLINES_MIN_SPACING_MS) await sleep(KLINES_MIN_SPACING_MS - since);
+  /** The item that owns the next send: always an interactive one when any is
+   *  waiting, and background work only when no client is queued at all. While
+   *  the venue is in its global cool-off the background lane is parked: sending
+   *  crawl traffic into a ban only extends it, and the crawl reads that as
+   *  "the lane did not go out" and backs off. */
+  function headItem() {
+    if (hiQueue.length) {
+      if (bgQueue.length) lane.yielded += 1;
+      return { item: hiQueue[0], queue: hiQueue };
+    }
+    if (bgQueue.length && !backgroundShouldWait()) return { item: bgQueue[0], queue: bgQueue };
+    return null;
+  }
+
+  /** Drop items whose budget ran out while they waited: a client that could not
+   *  get a slot in `KLINES_BUDGET_MS` is better served by the mirror answer it
+   *  can make immediately than by a request that would overrun both. */
+  function expire(now) {
+    for (const q of [hiQueue, bgQueue]) {
+      while (q.length && q[0].deadline <= now) {
+        const item = q.shift();
+        lane.expired += 1;
+        item.resolve(false);
+      }
+    }
+  }
+
+  function pump() {
+    if (closed || slot || laneTimer) return;
+    const now = Date.now();
+    expire(now);
+    const head = headItem();
+    if (!head) return;
+    const delay = laneDelay(head.item, Date.now());
+    if (delay === null) {
+      head.queue.shift();
+      lane.expired += 1;
+      head.item.resolve(false);
+      return pump();
+    }
+    if (delay > 0) {
+      laneWake = Date.now() + delay;
+      const t = setTimeout(() => { laneTimer = null; pump(); }, delay);
+      t.unref?.();
+      laneTimer = t;
+      return;
+    }
+    head.queue.shift();
+    slot = head.item;
     lastOut = Date.now();
-    return true;
+    if (head.item.background) lane.bg += 1; else lane.hi += 1;
+    head.item.resolve(true);
+  }
+
+  /** Ask for the outbound slot for one attempt. Resolves true when the caller
+   *  owns it (it must `release` when the attempt is over) and false when the
+   *  lane says the attempt should not go out at all. */
+  function takeLane({ background = false, budgetMs = KLINES_BUDGET_MS } = {}) {
+    // A gateway that is closing has nobody to serve: refuse rather than let a
+    // retry go out on a socket nobody is listening to any more.
+    if (closed) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const item = { resolve, background, deadline: Date.now() + Math.max(0, budgetMs) };
+      (background ? bgQueue : hiQueue).push(item);
+      // A parked lane wakes for the *first* reason; a client request parked
+      // behind a long cool-off would otherwise sleep past its own budget.
+      if (laneTimer && laneWake > item.deadline) {
+        clearTimeout(laneTimer);
+        laneTimer = null;
+      }
+      pump();
+    });
+  }
+
+  /** Retire the lane: every parked attempt is refused at once, so a probe that
+   *  started just before shutdown cannot still be spending its retries after it
+   *  (which would be an upstream request on a dead gateway's behalf, and in a
+   *  test suite an unattributable call in somebody else's stub). */
+  function stop() {
+    closed = true;
+    if (laneTimer) { clearTimeout(laneTimer); laneTimer = null; }
+    for (const q of [hiQueue, bgQueue]) {
+      while (q.length) q.shift().resolve(false);
+    }
+  }
+
+  function release() {
+    slot = null;
+    pump();
   }
 
   /** Drop entries the client is not asking for any more, then, if a burst of
@@ -268,67 +431,82 @@ function createKlinesFetcher({ store, logger }) {
   function upstream(key, symbol, interval, limit, endTime, background = false) {
     const pending = inflight.get(key);
     if (pending) return pending;
-
-    const task = enqueue(async () => {
-      const started = Date.now();
-      let lastErr;
-      for (let attempt = 0; attempt < KLINES_ATTEMPTS; attempt++) {
-        const left = KLINES_BUDGET_MS - (Date.now() - started);
-        if (left <= KLINES_MIN_SPACING_MS) break;
-        if (!(await pause(left))) break;
-        try {
-          const data = await fetchFromVenue(symbol, interval, limit, endTime,
-            Math.min(KLINES_ATTEMPT_TIMEOUT_MS, left));
-          circuitUntil = 0;
-          circuitErr = null;
-          warmWindow(symbol, interval);
-          cache.set(key, { at: Date.now(), data, source: "venue" });
-          trimCache();
-          // Only the window ending "now" is a usable fallback for "recent"; an
-          // older page deepens the mirror's history instead of replacing it.
-          if (endTime) store?.rememberOlder(symbol, interval, data);
-          else store?.remember(symbol, interval, data);
-          return { data, source: "venue" };
-        } catch (err) {
-          lastErr = err;
-          if (/403|429/.test(err.message)) {
-            circuitUntil = Date.now() + circuitMs;
-            circuitErr = err;
-          } else if (!/fetch failed|timeout|ECONN|socket|abort/i.test(err.message)) throw err;
-        }
-      }
-      // This window is refused right now. Give it a cool-off so the next reads
-      // — and the next refresh tick — answer from the mirror instead of
-      // queueing another doomed probe behind it.
-      coolWindow(symbol, interval);
-      // What we hold is still an answer: the recent window for a "recent" read,
-      // the older candles we have actually mirrored for a backfill read. A short
-      // backfill is reported as a mirror page, not as the end of history — the
-      // client must be able to tell "we have not mirrored that deep" from "the
-      // exchange has nothing older".
-      const fallback = endTime
-        ? store?.candlesBefore(symbol, interval, endTime, limit)
-        : recentHeld(symbol, interval, limit);
-      const reason = lastErr ?? circuitErr;
-      if (fallback && fallback.length) {
-        // Only worth a log when the mirror was the answer the client needed; a
-        // background revalidation of an already-served window is routine.
-        if (!background && !store?.venueBacked(symbol, interval)) {
-          logger.warn("klines served from cache", {
-            symbol, interval, err: String(reason?.message ?? reason ?? "budget"),
-          });
-        }
-        // Cache what we actually answered, so the next read of the same window
-        // is instant instead of paying for another doomed probe.
-        cache.set(key, { at: Date.now(), data: fallback, source: "mirror" });
-        trimCache();
-        return { data: fallback, source: "mirror" };
-      }
-      throw reason ?? new Error("Bybit request unavailable");
-    }).finally(() => inflight.delete(key));
-
+    const task = probe(key, symbol, interval, limit, endTime, background)
+      .finally(() => inflight.delete(key));
     inflight.set(key, task);
     return task;
+  }
+
+  /** One window's probe: at most `KLINES_ATTEMPTS` attempts, inside
+   *  `KLINES_BUDGET_MS` in total, each of which first has to win the lane. */
+  async function probe(key, symbol, interval, limit, endTime, background) {
+    const started = Date.now();
+    let lastErr;
+    for (let attempt = 0; attempt < KLINES_ATTEMPTS; attempt++) {
+      const left = KLINES_BUDGET_MS - (Date.now() - started);
+      if (left <= KLINES_MIN_SPACING_MS) break; // no room left for a real attempt
+      const mine = await takeLane({ background, budgetMs: left });
+      if (!mine) break; // the lane said: this one is not going out
+      try {
+        const data = await fetchFromVenue(symbol, interval, limit, endTime,
+          Math.min(KLINES_ATTEMPT_TIMEOUT_MS, left), logger);
+        return served(key, symbol, interval, endTime, data);
+      } catch (err) {
+        lastErr = err;
+        if (/403|429/.test(err.message)) {
+          circuitUntil = Date.now() + circuitMs;
+          circuitErr = err;
+        } else if (!/fetch failed|timeout|ECONN|socket|abort/i.test(err.message)) throw err;
+      } finally {
+        release();
+      }
+    }
+    return fromMirror(key, symbol, interval, limit, endTime, background, lastErr);
+  }
+
+  /** A page the venue actually served: clear both cool-offs, answer, mirror it. */
+  function served(key, symbol, interval, endTime, data) {
+    circuitUntil = 0;
+    circuitErr = null;
+    warmWindow(symbol, interval);
+    cache.set(key, { at: Date.now(), data, source: "venue" });
+    trimCache();
+    // Only the window ending "now" is a usable fallback for "recent"; an
+    // older page deepens the mirror's history instead of replacing it.
+    if (endTime) store?.rememberOlder(symbol, interval, data);
+    else store?.remember(symbol, interval, data);
+    return { data, source: "venue" };
+  }
+
+  /** The probe never landed. What we hold is still an answer: the recent window
+   *  for a "recent" read, the older candles we have actually mirrored for a
+   *  backfill read. A short backfill is reported as a mirror page, not as the end
+   *  of history — the client must be able to tell "we have not mirrored that
+   *  deep" from "the exchange has nothing older". */
+  function fromMirror(key, symbol, interval, limit, endTime, background, lastErr) {
+    // This window is refused right now. Give it a cool-off so the next reads
+    // — and the next refresh tick — answer from the mirror instead of
+    // queueing another doomed probe behind it.
+    coolWindow(symbol, interval);
+    const fallback = endTime
+      ? store?.candlesBefore(symbol, interval, endTime, limit)
+      : recentHeld(symbol, interval, limit);
+    const reason = lastErr ?? circuitErr;
+    if (fallback && fallback.length) {
+      // Only worth a log when the mirror was the answer the client needed; a
+      // background revalidation of an already-served window is routine.
+      if (!background && !store?.venueBacked(symbol, interval)) {
+        logger.warn("klines served from cache", {
+          symbol, interval, err: String(reason?.message ?? reason ?? "budget"),
+        });
+      }
+      // Cache what we actually answered, so the next read of the same window
+      // is instant instead of paying for another doomed probe.
+      cache.set(key, { at: Date.now(), data: fallback, source: "mirror" });
+      trimCache();
+      return { data: fallback, source: "mirror" };
+    }
+    throw reason ?? new Error("Bybit request unavailable");
   }
 
   /** Could an older page for this window actually be fetched right now? While
@@ -338,7 +516,22 @@ function createKlinesFetcher({ store, logger }) {
     return !windowCooling(symbol, interval) && !backgroundShouldWait();
   }
 
-  return { fetchKlines, canGoOlder };
+  /** What the lane has done, for the tests that assert a client request really
+   *  did overtake queued background work rather than merely being faster. */
+  function laneStats() {
+    return {
+      hi: lane.hi,
+      bg: lane.bg,
+      // Sends that went out for a client while background work was waiting: the
+      // yield, counted.
+      yielded: lane.yielded,
+      expired: lane.expired,
+      queued: { hi: hiQueue.length, bg: bgQueue.length },
+      busy: !!slot,
+    };
+  }
+
+  return { fetchKlines, canGoOlder, laneStats, stop };
 }
 
 /**
@@ -346,7 +539,7 @@ function createKlinesFetcher({ store, logger }) {
  * chronological order and the envelope shape are normalised here — clients
  * never see the venue's ordering.
  */
-async function fetchFromVenue(symbol, interval, limit, endTime, timeoutMs) {
+async function fetchFromVenue(symbol, interval, limit, endTime, timeoutMs, logger) {
   const params = new URLSearchParams({
     category: "spot",
     symbol,
@@ -367,20 +560,34 @@ async function fetchFromVenue(symbol, interval, limit, endTime, timeoutMs) {
   const ms = intervalMs(interval);
   const now = Date.now();
   // Bybit returns newest-first; reverse for chronological order
-  return list.reverse().map((c) => ({
-    interval,
-    openTime: Number(c[0]),
-    closeTime: Number(c[0]) + ms - 1,
-    open: String(c[1]),
-    high: String(c[2]),
-    low: String(c[3]),
-    close: String(c[4]),
-    volume: String(c[5]),
-    // The last row of every window is the candle still forming. Labelling it
-    // closed makes the client treat a partial bar as final and let a REST
-    // refresh rewind the live one.
-    closed: Number(c[0]) + ms <= now,
-  }));
+  const out = [];
+  let rejected = 0;
+  for (const c of list.reverse()) {
+    const openTime = Number(c[0]);
+    const candle = {
+      interval,
+      openTime,
+      closeTime: openTime + ms - 1,
+      open: String(c[1]),
+      high: String(c[2]),
+      low: String(c[3]),
+      close: String(c[4]),
+      volume: String(c[5]),
+      // The last row of every window is the candle still forming. Labelling it
+      // closed makes the client treat a partial bar as final and let a REST
+      // refresh rewind the live one.
+      closed: openTime + ms <= now,
+    };
+    // The same predicate the mirror applies on the way in, so a row the store
+    // would refuse never reaches a chart either. An absent bar is a hole the
+    // window reports; a repaired one would be invented market data.
+    if (toValidTuple(candle, interval)) out.push(candle);
+    else rejected += 1;
+  }
+  if (rejected && logger) {
+    logger.warn("bybit kline rows rejected", { symbol, interval, rejected, of: list.length });
+  }
+  return out;
 }
 
 /**
@@ -514,6 +721,22 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
         // upstream requests" can be read side by side instead of inferred.
         pages: p.pages,
         error: p.lastError,
+        // Whether the newest bar still reaches the present. `source: "mirror"`
+        // says this page is what we last had, but only this says how long ago
+        // "last" was — and a chart painted from a window that stopped days ago
+        // has to be able to say so instead of drawing a frozen edge as if it
+        // were now.
+        current: p.current,
+        // The newest run of bars the window should hold and does not, or null.
+        // A hole is invisible on a continuous time axis: the two candles either
+        // side of an outage sit next to each other and the chart simply looks
+        // like a market that moved fast. This is the only place the absence is
+        // recorded, so a client can tell the user what it is about to paint.
+        gap: p.gap,
+        // `gap` is what the crawl fetches next; this is the whole shortfall —
+        // every absent bar and every separate run. Quoting only `gap.bars` read
+        // as "short by 4" for a 1 m window missing 7,791 bars in 7 runs.
+        missing: p.missing,
       },
     };
   }
@@ -524,19 +747,27 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
     if (req.method !== "GET") { cors(res, 405, { error: "method_not_allowed" }); return; }
 
     if (u.pathname === "/healthz") {
-      respond(req, res, 200, { ok: true, venue: venues[0], instruments: instruments.symbols.length, source: instruments.source });
+      await respond(req, res, 200, { ok: true, venue: venues[0], instruments: instruments.symbols.length, source: instruments.source });
       return;
     }
 
     if (u.pathname === "/api/symbols") {
-      respond(req, res, 200, { data: { venue: venues[0], instruments: instruments.list() } });
+      await respond(req, res, 200, { data: { venue: venues[0], instruments: instruments.list() } });
       return;
     }
 
     if (u.pathname === "/api/klines") {
-      const sym = parseSymbol(u.searchParams.get("symbol"), "BTCUSDT");
+      const sym = parseSymbol(u.searchParams.get("symbol"));
       if (!sym) { cors(res, 400, { error: "BAD_SYMBOL" }); return; }
-      if (!instruments.has(sym)) { cors(res, 404, { error: "UNKNOWN_SYMBOL", symbol: sym }); return; }
+      if (!instruments.usable(sym)) {
+        // A structurally valid pair the cached registry does not know is not a
+        // broken client: the registry on disk can be hours old, and `usable` is
+        // deliberately permissive while hydration is still running. Give it one
+        // bounded, de-duplicated discovery pass before refusing, and refuse with
+        // the same envelope as before if the venue still does not list it.
+        const found = await instruments.resolve(sym);
+        if (!found) { cors(res, 404, { error: "UNKNOWN_SYMBOL", symbol: sym }); return; }
+      }
       const iv = parseInterval(u.searchParams.get("interval") ?? "1m");
       if (!iv) { cors(res, 400, { error: "BAD_INTERVAL", allowed: INTERVALS }); return; }
       const lim = parseLimit(u.searchParams.get("limit"));
@@ -544,8 +775,13 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
       const end = parseEndTime(u.searchParams.get("endTime"));
       if (!end.ok) { cors(res, 400, { error: "BAD_END_TIME" }); return; }
       try {
+        // The window's bytes come off disk *before* anything reads them, so the
+        // event loop stays free while a cold window is restored: an evicted
+        // window used to be gunzip'd synchronously inside the request.
+        await klinesStore.warm(sym, iv);
         const page = await fetchKlines(sym, iv, lim, end.value);
-        respond(req, res, 200, { data: page.data, meta: pageMeta(sym, iv, page) });
+        await respond(req, res, 200, { data: page.data, meta: pageMeta(sym, iv, page) },
+          `klines|${sym}|${iv}|${lim}|${end.value ?? ""}`);
         // Someone is reading this window, so it is the window worth deepening.
         // After the response, never before it: the crawl answers the chart from
         // the mirror while the pages arrive, and `trigger` is idempotent, so ten
@@ -627,6 +863,17 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
     return null;
   }
 
+  /** A pair the registry does not know is refused on the websocket — but the
+   *  message path cannot await a venue round trip (a client that sends five
+   *  subscriptions expects five answers, in order), so the registry is asked in
+   *  the background instead. `resolve` is de-duplicated and cooldown-bounded, so
+   *  a client retrying a typo costs one live call per cooldown rather than one
+   *  per message, and the retry after a real listing succeeds because the list
+   *  has landed. */
+  function askInstruments(sym) {
+    instruments.resolve(sym).catch(() => false);
+  }
+
   wss.on("connection", (ws) => {
     const client = {
       ws,
@@ -660,7 +907,7 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
           if (!CHANNELS.includes(ch.channel)) { sendError(client, "BAD_CHANNEL", `unknown channel: ${ch.channel}`); continue; }
           const sym = parseSymbol(ch.symbol);
           if (!sym) { rejectSymbol(client, ch.symbol); continue; }
-          if (!instruments.has(sym)) { rejectSymbol(client, sym); continue; }
+          if (!instruments.usable(sym)) { askInstruments(sym); rejectSymbol(client, sym); continue; }
           let iv;
           if (ch.channel === "kline") {
             iv = parseInterval(ch.interval);
@@ -691,7 +938,7 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
       } else if (msg.type === "select_symbol" && msg.symbol) {
         const sym = parseSymbol(msg.symbol);
         if (!sym) { sendError(client, "BAD_REQUEST", "invalid symbol"); return; }
-        if (!instruments.has(sym)) { rejectSymbol(client, sym); return; }
+        if (!instruments.usable(sym)) { askInstruments(sym); rejectSymbol(client, sym); return; }
         if (clientSym.get(client) === sym) return;
         clientSym.set(client, sym);
         syncDetail();
@@ -706,10 +953,28 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
     ws.on("error", (err) => { logger.warn("ws error", { err: err.message }); release(); });
   });
 
-  wss.on("close", () => { stopKlineRefresh(); historyCrawl.stop(); hub.stop(); });
-  server.on("close", () => { stopKlineRefresh(); historyCrawl.stop(); hub.stop(); });
+  /** Everything background-ish that could still hold a socket or the lane:
+   *  the refresh tick, the crawl's pending pages, and the lane's parked retries.
+   *  Idempotent — both the wss and the http server fire `close`. */
+  const stopServing = () => {
+    stopKlineRefresh();
+    historyCrawl.stop();
+    fetcher.stop();
+    hub.stop();
+  };
+  wss.on("close", stopServing);
+  server.on("close", stopServing);
 
-  return { server, hub, syncBridge, klines: klinesStore, klineCrawler: historyCrawl };
+  return {
+    server,
+    hub,
+    syncBridge,
+    klines: klinesStore,
+    klineCrawler: historyCrawl,
+    // Who the upstream lane has been serving: `{ hi, bg, yielded }`, so the
+    // priority rule the lane exists for is observable instead of assumed.
+    klineLane: fetcher.laneStats,
+  };
 }
 
 /** Protocol error envelope: `{ code, message }` (see docs/PROTOCOL.md). Clients

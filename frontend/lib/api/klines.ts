@@ -142,7 +142,7 @@ export async function loadHistoricalKlines(
     // The page is a snapshot of the venue as of `cursor`: the store keeps any
     // candle the stream touched after that instead of painting over it.
     useMarketStore.getState().mergeKlinesInto(symbol, interval, page.candles, cursor);
-    useMarketStore.getState().setKlineStatus(symbol, interval, "ready");
+    useMarketStore.getState().setKlineStatus(symbol, interval, "ready", undefined, page.history?.status);
     primeOlder(symbol, interval, page, page.candles.length >= limit);
     return true;
   } catch (err) {

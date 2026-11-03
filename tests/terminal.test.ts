@@ -2,7 +2,7 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { useAlertsStore } from "../frontend/lib/store/alertsStore.ts";
 import { useWatchlistStore } from "../frontend/lib/store/watchlistStore.ts";
-import { useLayoutStore, WATCHLIST_MIN, WATCHLIST_MAX } from "../frontend/lib/store/layoutStore.ts";
+import { useLayoutStore, WATCHLIST_MIN, WATCHLIST_MAX, RAIL_MIN, RAIL_MAX } from "../frontend/lib/store/layoutStore.ts";
 import { useChartStore } from "../frontend/lib/store/chartStore.ts";
 import { drawingForTool, drawingTypeForTool, isPlacementTool, makeDrawing, pointsRequired, positionMetrics, TOOL_BY_ID, TOOL_GROUPS, TOOLS, toolHint, toolsInGroup } from "../frontend/lib/utils/drawings.ts";
 
@@ -69,6 +69,14 @@ test("layout: watchlist width is clamped to the valid range", () => {
   assert.equal(useLayoutStore.getState().watchlistWidth, WATCHLIST_MIN);
   useLayoutStore.getState().setWatchlistWidth(9999);
   assert.equal(useLayoutStore.getState().watchlistWidth, WATCHLIST_MAX);
+});
+
+test("layout: right rail width is clamped to the valid range", () => {
+  useLayoutStore.getState().setRightPanelWidth(10);
+  assert.equal(useLayoutStore.getState().rightPanelWidth, RAIL_MIN);
+  useLayoutStore.getState().setRightPanelWidth(9999);
+  assert.equal(useLayoutStore.getState().rightPanelWidth, RAIL_MAX);
+  useLayoutStore.getState().reset();
 });
 
 test("layout: toggle flips panel visibility and reset restores defaults", () => {

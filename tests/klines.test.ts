@@ -10,9 +10,11 @@ import {
   mergeRawKline,
   diffKlines,
   toCandleBars,
+  toIndicatorBars,
   toLineBars,
   toVolumeBars,
   buildTimeIndex,
+  missingHistory,
   switchVisibleRange,
   SWITCH_VISIBLE_BARS,
   SWITCH_RIGHT_PAD,
@@ -44,6 +46,15 @@ function raw(openTime: number, extra: Record<string, unknown> = {}) {
 
 function norm(n: number, close = "105"): KlineData {
   return normalizeKline(raw(BASE + n * MIN, { close }), "1m")!;
+}
+
+const NOW = Math.floor(Date.now() / MIN) * MIN;
+
+/** A bar `n` minutes before the present. Missing history is counted against the
+ *  minute the market is in now, so a fixture parked in 2023 is a window with
+ *  three years absent and nothing else — these tests need bars that are due. */
+function live(n: number): KlineData {
+  return normalizeKline(raw(NOW - n * MIN), "1m")!;
 }
 
 function ascending(list: KlineData[]): boolean {
@@ -245,6 +256,24 @@ test("mappings are index-aligned with the source array", () => {
   assert.equal(buildTimeIndex(ks).get(Math.floor((BASE + 100 * MIN) / 1000)), ks[0]);
 });
 
+test("toIndicatorBars: an overlay keeps the candles' axis", () => {
+  // bars 100, 101 then 105 — three slots the venue never served in between.
+  const ks = [norm(100, "101"), norm(101, "102"), norm(105, "103")];
+  const out = toIndicatorBars(ks, [null, 1, 2]);
+  const times = out.map((b) => Number(b.time));
+  assert.deepEqual(
+    times,
+    [100, 101, 102, 103, 104, 105].map((s) => Math.floor((BASE + s * MIN) / 1000)),
+    "the missing slots are reserved, exactly as the candles reserve them",
+  );
+  assert.deepEqual(times, toCandleBars(ks).map((b) => Number(b.time)), "same axis as the candles");
+  assert.deepEqual(
+    out.filter((b) => "value" in b).map((b) => (b as { value: number }).value),
+    [1, 2],
+    "a warm-up slot carries no value rather than shifting the line left",
+  );
+});
+
 test("klineKey is stable and unique per window", () => {
   assert.equal(klineKey("BTCUSDT", "1m"), "BTCUSDT:1m");
   assert.notEqual(klineKey("BTCUSDT", "1m"), klineKey("BTCUSDT", "5m"));
@@ -256,22 +285,61 @@ test("EMPTY_KLINES is a stable empty reference", () => {
 });
 
 test("switchVisibleRange right-aligns a sane number of bars for any window", () => {
+  /** A contiguous 1m window of `count` candles — no holes, so its axis is its
+   *  candle count and the range is the plain arithmetic it always was. */
+  const series = (count: number) => normalizeKlines(
+    Array.from({ length: count }, (_, i) => raw(BASE + i * MIN)),
+  ) as unknown as KlineData[];
+
   // Nothing loaded yet: an empty chart still needs a positive-width viewport,
   // otherwise the first page lands on a zero-bar range and looks like a failure.
-  assert.deepEqual(switchVisibleRange(0), { from: 0, to: SWITCH_RIGHT_PAD });
+  assert.deepEqual(switchVisibleRange([]), { from: 0, to: SWITCH_RIGHT_PAD });
   // Shorter than the target window -> show all of it from index 0.
-  assert.deepEqual(switchVisibleRange(50), { from: 0, to: 50 + SWITCH_RIGHT_PAD });
-  assert.deepEqual(switchVisibleRange(500), {
+  assert.deepEqual(switchVisibleRange(series(50)), { from: 0, to: 50 + SWITCH_RIGHT_PAD });
+  assert.deepEqual(switchVisibleRange(series(500)), {
     from: 500 - SWITCH_VISIBLE_BARS,
     to: 500 + SWITCH_RIGHT_PAD,
   });
 
   for (const count of [1, 2, 119, 120, 121, 1000, MAX_KLINES]) {
-    const r = switchVisibleRange(count);
+    const r = switchVisibleRange(series(count));
     assert.ok(r.from >= 0, `from clamped below 0 for ${count}`);
     assert.ok(r.to > r.from, `zero-width window for ${count}`);
     // The newest bar is always inside the window, with pad to its right.
     assert.ok(r.to > count, `newest bar outside the window for ${count}`);
     assert.ok(r.to - r.from >= Math.min(count, SWITCH_VISIBLE_BARS));
   }
+
+  // The promise is in candles, not in axis positions: a window whose recent
+  // history has an outage in it still opens on SWITCH_VISIBLE_BARS of price,
+  // with the holes drawn inside that span rather than pushing the bars away.
+  const holed = normalizeKlines([
+    ...Array.from({ length: 300 }, (_, i) => raw(BASE + i * MIN)),
+    ...Array.from({ length: 120 }, (_, i) => raw(BASE + 300 * MIN + 500 * MIN + i * MIN)),
+  ]) as unknown as KlineData[];
+  const r = switchVisibleRange(holed);
+  assert.equal(r.to, 420 + 500 + SWITCH_RIGHT_PAD, "the axis counts the 500 absent bars");
+  assert.equal(r.from, 420 + 500 - SWITCH_VISIBLE_BARS, "and the view still holds 120 candles");
+});
+
+/* ── the candles the axis cannot show ─────────────────────────────────── */
+
+test("missingHistory is silent about a window that holds every bar", () => {
+  assert.deepEqual(missingHistory([], "1m"), { bars: 0, lagMs: 0 }, "nothing loaded is not missing history");
+  assert.deepEqual(missingHistory([live(2), live(1), live(0)], "1m"), { bars: 0, lagMs: 0 },
+    "the minute still forming is a bar that has not arrived yet, not a hole");
+});
+
+test("missingHistory counts the run the time scale paints over", () => {
+  // Fifty minutes missing inside the window and seven more between the healed
+  // group and the present: the chart draws all of it as one continuous axis.
+  const holed = [live(61), live(60), live(9), live(8), live(0)];
+  assert.equal(missingHistory(holed, "1m").bars, 50 + 7, "every absent slot, not only the newest run");
+});
+
+test("missingHistory reports a right edge that stopped covering the present", () => {
+  const stale = [live(60), live(59)]; // the feed went quiet an hour ago
+  const m = missingHistory(stale, "1m");
+  assert.ok(m.lagMs >= 59 * MIN, `the newest bar is nearly an hour behind, saw ${m.lagMs}ms`);
+  assert.equal(m.bars, m.lagMs / MIN - 1, "the closed minutes behind it are the count; the present one is not");
 });

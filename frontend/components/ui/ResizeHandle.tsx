@@ -9,13 +9,16 @@ interface ResizeHandleProps {
   /** Applies the new size (already clamped is the caller's job). */
   onResize: (size: number) => void;
   ariaLabel: string;
+  /** For a panel pinned to the right/bottom edge: dragging towards the edge
+   *  grows it, so the pointer delta is subtracted instead of added. */
+  invert?: boolean;
 }
 
 /**
  * Pointer-driven resize handle. No external deps; uses pointer capture so the
  * drag keeps tracking even when the pointer leaves the handle.
  */
-export function ResizeHandle({ orientation, getSize, onResize, ariaLabel }: ResizeHandleProps) {
+export function ResizeHandle({ orientation, getSize, onResize, ariaLabel, invert = false }: ResizeHandleProps) {
   const start = useRef<{ pos: number; size: number } | null>(null);
 
   const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
@@ -29,8 +32,9 @@ export function ResizeHandle({ orientation, getSize, onResize, ariaLabel }: Resi
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (!start.current) return;
     const pos = orientation === "vertical" ? e.clientX : e.clientY;
-    onResize(start.current.size + (pos - start.current.pos));
-  }, [orientation, onResize]);
+    const delta = pos - start.current.pos;
+    onResize(start.current.size + (invert ? -delta : delta));
+  }, [orientation, onResize, invert]);
 
   const end = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (!start.current) return;

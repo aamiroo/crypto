@@ -142,6 +142,7 @@ export interface LayoutState {
   watchlistOpen: boolean;
   watchlistWidth: number;
   rightPanelOpen: boolean;
+  rightPanelWidth: number;
 }
 
 export type ToastKind = "success" | "error" | "info" | "warning";

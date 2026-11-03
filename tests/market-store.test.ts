@@ -1,6 +1,6 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { useMarketStore, selectDepth, selectBestBid, selectBestAsk } from "../frontend/lib/store/marketStore.ts";
+import { useMarketStore, selectDepth, selectBestBid, selectBestAsk, mostLiquid, topLiquid } from "../frontend/lib/store/marketStore.ts";
 import type { Envelope } from "../frontend/lib/types.ts";
 
 function reset() {
@@ -52,4 +52,42 @@ test("trades prepend newest-first and are capped", () => {
   const list = useMarketStore.getState().recentTrades["BTCUSDT"]!;
   assert.equal(list.length, 100);
   assert.equal(list[0]!.price, "104");
+});
+
+// ── liquidity ranking ───────────────────────────────────────────────────
+
+/** A ticker with a given quote turnover, and a base volume deliberately the
+ *  other way round: the test has to show which of the two the ranking reads. */
+const priced = (turnover24h: string, volume24h: string) => ({
+  lastPrice: "1", change24h: "0", high24h: "1", low24h: "1", volume24h, turnover24h,
+});
+
+test("mostLiquid ranks by quote turnover, not by base volume or listing order", () => {
+  const symbols = ["BTCUSDT", "MEMEUSDT", "ETHUSDT"];
+  const tickers = {
+    // 3 BTC traded 100k of quote; 1.2M MEME coins traded 10k. Only the quote
+    // comparison means anything across pairs of that size.
+    BTCUSDT: priced("100000", "3"),
+    MEMEUSDT: priced("10000", "1200000"),
+    ETHUSDT: priced("50000", "400"),
+  };
+  assert.deepEqual(mostLiquid(symbols, tickers, 3), ["BTCUSDT", "ETHUSDT", "MEMEUSDT"]);
+  assert.deepEqual(
+    mostLiquid(["NEWUSDT", ...symbols], tickers, 3),
+    ["BTCUSDT", "ETHUSDT", "MEMEUSDT"],
+    "a pair the feed has not priced yet cannot outrank a market it has",
+  );
+});
+
+test("topLiquid holds the ranking while the feed keeps ticking", () => {
+  const symbols = ["BTCUSDT", "ETHUSDT"];
+  const first = topLiquid(symbols, { BTCUSDT: priced("100", "1"), ETHUSDT: priced("200", "1") }, 2);
+  assert.deepEqual(first, ["ETHUSDT", "BTCUSDT"]);
+  // Same pairs priced, same symbol set, new values: the array a component memoises
+  // on must not change identity, or the default list reorders under the pointer.
+  const second = topLiquid(symbols, { BTCUSDT: priced("900", "1"), ETHUSDT: priced("30", "1") }, 2);
+  assert.equal(second, first, "a ticker flush is not a change of market");
+  // A pair the feed has only now reached changes the set, so the order may move.
+  const third = topLiquid(symbols, { BTCUSDT: priced("900", "1"), ETHUSDT: priced("30", "1"), SOLUSDT: priced("9", "1") }, 2);
+  assert.notEqual(third, first);
 });

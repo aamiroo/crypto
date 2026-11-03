@@ -6,20 +6,28 @@ const KEY = "ct_layout";
 
 const DEFAULTS: LayoutState = {
   watchlistOpen: true,
-  watchlistWidth: 224,
+  watchlistWidth: 272,
   rightPanelOpen: true,
+  rightPanelWidth: 320,
 };
 
-export const WATCHLIST_MIN = 180;
+/** The row is `16px star · name · 62px price · 46px 24h · 44px vol` plus gaps and
+ *  padding, so the name column only gets what is left of ~200px. Under this
+ *  width the ticker text collapses to zero width and the watchlist shows rows of
+ *  numbers with no symbol on them. */
+export const WATCHLIST_MIN = 232;
 export const WATCHLIST_MAX = 380;
+export const RAIL_MIN = 260;
+export const RAIL_MAX = 520;
 
 interface LayoutStore extends LayoutState {
   toggle: (panel: keyof Pick<LayoutState, "watchlistOpen" | "rightPanelOpen">) => void;
   setWatchlistWidth: (w: number) => void;
+  setRightPanelWidth: (w: number) => void;
   reset: () => void;
 }
 
-/** Only the three known fields are taken from the cache; a stale or hand-edited
+/** Only the known fields are taken from the cache; a stale or hand-edited
  *  blob must not smuggle a non-number width or a non-boolean flag into layout. */
 function sanitizeLayout(value: unknown): LayoutState {
   const base = { ...DEFAULTS };
@@ -28,6 +36,9 @@ function sanitizeLayout(value: unknown): LayoutState {
   if (typeof value.rightPanelOpen === "boolean") base.rightPanelOpen = value.rightPanelOpen;
   if (typeof value.watchlistWidth === "number" && Number.isFinite(value.watchlistWidth)) {
     base.watchlistWidth = clamp(value.watchlistWidth, WATCHLIST_MIN, WATCHLIST_MAX);
+  }
+  if (typeof value.rightPanelWidth === "number" && Number.isFinite(value.rightPanelWidth)) {
+    base.rightPanelWidth = clamp(value.rightPanelWidth, RAIL_MIN, RAIL_MAX);
   }
   return base;
 }
@@ -49,6 +60,13 @@ export const useLayoutStore = create<LayoutStore>((set) => ({
       return { watchlistWidth: width };
     }),
 
+  setRightPanelWidth: (w) =>
+    set((s) => {
+      const width = clamp(w, RAIL_MIN, RAIL_MAX);
+      persist(KEY, { ...strip(s), rightPanelWidth: width });
+      return { rightPanelWidth: width };
+    }),
+
   reset: () => {
     persist(KEY, DEFAULTS);
     set({ ...DEFAULTS });
@@ -66,5 +84,6 @@ function strip(s: LayoutState): LayoutState {
     watchlistOpen: s.watchlistOpen,
     watchlistWidth: s.watchlistWidth,
     rightPanelOpen: s.rightPanelOpen,
+    rightPanelWidth: s.rightPanelWidth,
   };
 }

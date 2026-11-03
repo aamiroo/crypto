@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useCallback } from "react";
 import { MarketWSClient } from "@/lib/ws/client";
-import { useMarketStore } from "@/lib/store/marketStore";
+import { useMarketStore, mostLiquid } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
 import { toast } from "@/lib/store/toastStore";
 import { loadHistoricalKlines, refreshRecentKlines } from "@/lib/api/klines";
@@ -54,7 +54,10 @@ export function useMarketFeed() {
     }
 
     client.selectSymbol(sym);
-    client.subscribe({ channel: "orderbook", symbol: sym, depth: 25 });
+    // 50 is what the venue actually streams (Bybit's `orderbook.50` topic) and the
+    // deepest the panel can show; asking for less would only make the book's own
+    // depth control lie about how many levels it can fill.
+    client.subscribe({ channel: "orderbook", symbol: sym, depth: 50 });
     client.subscribe({ channel: "trades", symbol: sym });
     subscribeLiveKline(client, sym, iv);
 
@@ -81,7 +84,13 @@ export function useMarketFeed() {
         const current = useMarketStore.getState().symbol;
         const known = instruments.some((i) => i.symbol === current);
         if (!known && !symbolRef.current && instruments.length > 0) {
-          useMarketStore.getState().setSymbol(instruments[0]!.symbol);
+          // The stored pair is not on the venue's list (delisted, or a quote the
+          // gateway does not collect). Pick the most traded pair rather than the
+          // first row of the exchange's catalogue, and say so — a chart that
+          // quietly changes symbol under the user is worse than a warning.
+          const picked = mostLiquid(instruments.map((i) => i.symbol), useMarketStore.getState().tickers, 1)[0]!;
+          useMarketStore.getState().setSymbol(picked);
+          if (current) toast("warning", `${current} is not listed on ${data?.venue ?? "the venue"} — showing ${picked}`);
         }
       } else if (env.type === "error") {
         const e = env.data as { code?: string; message?: string } | undefined;
@@ -100,6 +109,16 @@ export function useMarketFeed() {
       droppedRef.current = false;
       void loadHistoricalKlines(useMarketStore.getState().symbol, useChartStore.getState().timeframe);
     });
+
+    // A brand-new client carries no subscriptions. These refs survive it, because
+    // React keeps the component instance across StrictMode's double-mount and
+    // across Fast Refresh — and both re-run this effect with a fresh client.
+    // Without the reset, the symbol/timeframe effects below compare against the
+    // OLD client's selections and skip their work, so only the ticker batch is
+    // ever sent: the order book, trades and the live candle stay on "Waiting…"
+    // forever in `next dev`.
+    symbolRef.current = "";
+    intervalRef.current = "";
 
     client.connect();
 

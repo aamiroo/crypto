@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMarketStore } from "@/lib/store/marketStore";
+import { useMarketStore, topLiquid } from "@/lib/store/marketStore";
 import { useWatchlistStore } from "@/lib/store/watchlistStore";
 import { fmtPrice, fmtPct } from "@/lib/utils/format";
 import { baseAsset } from "@/lib/utils/symbol";
 import { CoinIcon } from "@/components/CoinIcon";
+import { SearchIcon } from "@/components/icons/ToolIcons";
 
 /**
  * Searchable symbol selector with keyboard navigation. Live prices come from
@@ -24,14 +25,23 @@ export function SymbolPicker() {
   const ref = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // With no query the list is the market's own priority order — favourites on
+  // top, then the most liquid pairs. Slicing the alphabetical list instead would
+  // show 40 pairs that happen to start with "1" or "A" and hide every pair the
+  // user actually came here to find.
   const filtered = useMemo(() => {
     const q = query.trim().toUpperCase();
-    const list = q ? symbols.filter((s) => s.includes(q)) : symbols;
+    if (!q) {
+      const favSet = new Set(favorites);
+      const rest = topLiquid(symbols, tickers, 40).filter((s) => !favSet.has(s));
+      return [...favorites.filter((s) => symbols.includes(s)), ...rest].slice(0, 60);
+    }
     const rank = (s: string) => (favorites.includes(s) ? 0 : 1);
-    return [...list]
+    return symbols
+      .filter((s) => s.includes(q))
       .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
-      .slice(0, 40);
-  }, [symbols, favorites, query]);
+      .slice(0, 60);
+  }, [symbols, favorites, query, tickers]);
 
   useEffect(() => {
     if (!open) return;
@@ -40,11 +50,10 @@ export function SymbolPicker() {
     return () => document.removeEventListener("mousedown", onDown);
   }, [open]);
 
-  useEffect(() => { setHighlight(0); }, [query]);
-
   const choose = (sym: string) => {
     setSymbol(sym);
     setQuery("");
+    setHighlight(0);
     setOpen(false);
     inputRef.current?.blur();
   };
@@ -59,11 +68,11 @@ export function SymbolPicker() {
   return (
     <div className="relative" ref={ref}>
       <div className="flex h-7 items-center gap-1 rounded px-2" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
-        <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>⌕</span>
+        <span className="flex flex-shrink-0 items-center" style={{ color: "var(--text-muted)" }}><SearchIcon size={13} /></span>
         <input
           ref={inputRef}
           value={query}
-          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onChange={(e) => { setQuery(e.target.value); setHighlight(0); setOpen(true); }}
           onFocus={() => setOpen(true)}
           onKeyDown={onKeyDown}
           placeholder={baseAsset(selected) + "/USDT"}

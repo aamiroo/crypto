@@ -8,7 +8,7 @@ import { ChartSettingsMenu } from "@/components/ChartSettingsMenu";
 import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
 import { TOOL_GROUPS, toolsInGroup } from "@/lib/utils/drawings";
 import {
-  CursorIcon, EyeIcon, EyeOffIcon, FibonacciIcon, HorizontalIcon, LayersIcon,
+  CursorIcon, CaretIcon, EyeIcon, EyeOffIcon, ExpandIcon, CollapseIcon, FibonacciIcon, HorizontalIcon, LayersIcon,
   LongPositionIcon, MeasureIcon, RayIcon, RedoIcon, ShortPositionIcon,
   TrashIcon, TrendlineIcon, UndoIcon, VerticalIcon,
 } from "@/components/icons/ToolIcons";
@@ -157,7 +157,7 @@ export function ChartToolbar({ symbol }: { symbol: string }) {
 
       <div className="flex-1" />
 
-      <Popover label="⤢" tooltip="Reset view (R)" align="right" width={150}>
+      <Popover label={<ExpandIcon size={14} />} tooltip="Reset view (R)" align="right" width={150}>
         {(close) => (
           <button
             onClick={() => { window.dispatchEvent(new Event(RESET_VIEW_EVENT)); close(); }}
@@ -172,9 +172,9 @@ export function ChartToolbar({ symbol }: { symbol: string }) {
         onClick={() => setFullscreen(!fullscreen)}
         data-tooltip={fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
         aria-label="Toggle fullscreen"
-        className="icon-btn tooltip-trigger h-7 w-7 flex-shrink-0 text-[13px]"
+        className="icon-btn tooltip-trigger h-7 w-7 flex-shrink-0"
       >
-        {fullscreen ? "⤡" : "⤢"}
+        {fullscreen ? <CollapseIcon size={14} /> : <ExpandIcon size={14} />}
       </button>
     </div>
   );
@@ -227,7 +227,7 @@ function ToolFlyout({
       label={(
         <>
           <ShownIcon size={15} />
-          <span className="text-[8px] leading-none" style={{ color: "var(--text-muted)" }}>▾</span>
+          <CaretIcon size={9} className="rotate-180 opacity-60" />
           {armedHere && sticky && <span className="sticky-dot" title="Kept armed: draws shape after shape" />}
         </>
       )}

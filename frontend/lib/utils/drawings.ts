@@ -127,7 +127,9 @@ export function drawingTypeForTool(tool: ChartTool): DrawingType | null {
 export const COLORS: Record<DrawingType, string> = {
   horizontal: "#f59e0b",
   vertical: "#8b5cf6",
-  trendline: "#e2e8f0",
+  // Not #e2e8f0: a near-white trendline was invisible on the light theme, which
+  // made trendlines look broken there. This grey has contrast in both.
+  trendline: "#8f9bb3",
   ray: "#38bdf8",
   fibonacci: "#f59e0b",
   measure: "#38bdf8",
@@ -137,7 +139,7 @@ export const COLORS: Record<DrawingType, string> = {
 
 /** Swatches offered on the selected shape. Small set on purpose: recoloring is
  *  a quick tidy-up, not a paint app, and every extra swatch costs toolbar width. */
-export const PALETTE = ["#e2e8f0", "#f59e0b", "#38bdf8", "#10b981", "#f43f5e", "#8b5cf6"];
+export const PALETTE = ["#8f9bb3", "#f59e0b", "#38bdf8", "#10b981", "#f43f5e", "#8b5cf6"];
 
 /**
  * Third click of a position tool: mirror the risk distance so the shape is

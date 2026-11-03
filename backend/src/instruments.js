@@ -6,6 +6,11 @@ const BYBIT_REST = process.env.BYBIT_REST || "https://api.bybit.com";
 const REFRESH_MS = 6 * 60 * 60 * 1000;
 const CACHE_FILE = path.join(import.meta.dirname, "..", "data", "instruments.json");
 
+/** Registry states that came from the venue and can therefore be *widened* by a
+ *  discovery pass. `empty`, `test` and `override` cannot: the first knows
+ *  nothing, the second and third are complete by construction. See `resolve`. */
+const DISCOVERABLE = new Set(["live", "cache", "fallback"]);
+
 /** Decimal places implied by an exchange step size ("0.01" -> 2, "1" -> 0). */
 export function decimalsOf(step) {
   const s = String(step ?? "");
@@ -68,6 +73,14 @@ export class Instruments {
     this.source = "empty";
     this.updatedAt = 0;
     this.onChange = null;
+    /** False only while a background hydration pass is in flight. A registry that
+     *  has not had its first look at the disk yet must not be the reason a valid
+     *  symbol gets rejected — see `hydrate`. */
+    this.ready = true;
+    /** One discovery attempt at a time, and not more often than this: a client
+     *  typoing a symbol must not turn into a live fetch per request. */
+    this.discovery = null;
+    this.discoveryUntil = 0;
   }
 
   get symbols() { return [...this.items.keys()]; }
@@ -165,11 +178,69 @@ export class Instruments {
     return () => clearInterval(timer);
   }
 
+  /** True when this symbol may be served right now, without waiting on anything:
+   *  either the registry knows it, or the registry has not finished its first
+   *  hydration pass and therefore has no authority to refuse it. */
+  usable(symbol) {
+    return this.items.has(String(symbol || "").toUpperCase()) || !this.ready;
+  }
+
+  /** A structurally valid symbol the cached registry does not know is not proof
+   *  of a bad client — the cache can be hours old, and a pair listed yesterday is
+   *  not in it. Ask for it once (de-duplicated, cooldown-bounded, on its own
+   *  request rather than the kline lane) and only refuse afterwards. A caller that
+   *  cannot wait uses this as fire-and-forget: the attempt runs regardless, so the
+   *  client's retry finds the symbol instead of hitting the same wall. */
+  async resolve(symbol, { budgetMs = 1200, cooldownMs = 30000 } = {}) {
+    const s = String(symbol || "").toUpperCase();
+    if (this.items.has(s)) return true;
+    // An operator's `SYMBOLS` list is the policy, not a cache to be widened, and a
+    // registry that never came from the venue (a test fixture) has no wider list
+    // to discover into: asking would be a pointless live call.
+    if (!DISCOVERABLE.has(this.source)) return false;
+    if (!this.discovery && Date.now() >= this.discoveryUntil) {
+      this.discoveryUntil = Date.now() + cooldownMs;
+      this.discovery = this.refresh()
+        .catch((err) => { this.logger.warn("instrument discovery failed", { err: err.message }); return false; })
+        .finally(() => { this.discovery = null; });
+    }
+    if (!this.discovery) return false;
+    // Bounded: a client must not pay a whole venue round trip for a registry
+    // question. The attempt keeps running behind the answer either way.
+    await Promise.race([this.discovery, new Promise((r) => setTimeout(r, budgetMs))]);
+    return this.items.has(s);
+  }
+
   /** Boot ordering: disk cache (fast, accurate) → live fetch → bundled snapshot. */
   async bootstrap() {
     await this.loadCache();
     await this.refresh().catch(() => false);
     if (this.items.size === 0) this.replace(fallbackInstruments, "fallback");
+    return this;
+  }
+
+  /** The same ordering as `bootstrap`, but built to run *behind* a listening
+   *  port: the disk cache answers `/api/symbols` and validates symbols as soon as
+   *  it has been read (a few ms, async), the live list follows whenever the venue
+   *  gets round to answering. `ready` is what the gateway reads to decide that a
+   *  mid-pass registry may not reject a well-formed symbol. */
+  async hydrate({ restrictTo = null } = {}) {
+    this.ready = false;
+    try {
+      await this.loadCache();
+      if (restrictTo?.length) this.restrict(restrictTo);
+      await this.refresh();
+      if (this.items.size === 0) this.replace(fallbackInstruments, "fallback");
+      // A live list replaces the whole map, so the operator's restriction is
+      // re-applied on top of whatever the venue just said.
+      else if (restrictTo?.length) this.restrict(restrictTo);
+    } catch (err) {
+      this.logger.warn("instrument hydration failed", { err: err.message });
+      if (this.items.size === 0) this.replace(fallbackInstruments, "fallback");
+    } finally {
+      this.ready = true;
+      this.onHydrated?.(this);
+    }
     return this;
   }
 }

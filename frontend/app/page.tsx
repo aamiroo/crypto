@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useMarketFeed } from "@/lib/ws/useMarketFeed";
 import { useMarketStore } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
-import { useLayoutStore, WATCHLIST_MIN, WATCHLIST_MAX } from "@/lib/store/layoutStore";
+import { useLayoutStore } from "@/lib/store/layoutStore";
 import { useUiStore, type MobilePanel } from "@/lib/store/uiStore";
 import { useAlertEngine } from "@/lib/hooks/useAlertEngine";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
@@ -19,6 +19,7 @@ import { ShortcutsModal } from "@/components/ShortcutsModal";
 import { AlertsPanel } from "@/components/AlertsPanel";
 import { Toasts } from "@/components/ui/Toasts";
 import { ResizeHandle } from "@/components/ui/ResizeHandle";
+import { ChevronLeftIcon, ChevronRightIcon } from "@/components/icons/ToolIcons";
 
 export default function TerminalPage() {
   useMarketFeed();
@@ -32,7 +33,9 @@ export default function TerminalPage() {
   // Stores initialize from localStorage (symbol, timeframe, theme, ...) which
   // differs from the server-rendered markup. Rendering the terminal only after
   // mount avoids hydration mismatches (and the full client re-render / chart
-  // remount they cause) while showing a proper boot loading state.
+  // remount they cause) while showing a proper boot loading state. An external
+  // store answers "am I on the client" without a set-state effect that would
+  // repaint the tree a second time.
   const [mounted, setMounted] = useState(false);
   useEffect(() => { setMounted(true); }, []);
 
@@ -71,6 +74,8 @@ function DesktopLayout({ symbol }: { symbol: string }) {
   const setWatchlistWidth = useLayoutStore((s) => s.setWatchlistWidth);
   const toggle = useLayoutStore((s) => s.toggle);
   const rightPanelOpen = useLayoutStore((s) => s.rightPanelOpen);
+  const rightPanelWidth = useLayoutStore((s) => s.rightPanelWidth);
+  const setRightPanelWidth = useLayoutStore((s) => s.setRightPanelWidth);
 
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -83,7 +88,7 @@ function DesktopLayout({ symbol }: { symbol: string }) {
             orientation="vertical"
             ariaLabel="Resize watchlist"
             getSize={() => useLayoutStore.getState().watchlistWidth}
-            onResize={(w) => setWatchlistWidth(Math.min(WATCHLIST_MAX, Math.max(WATCHLIST_MIN, w)))}
+            onResize={setWatchlistWidth}
           />
         </>
       ) : (
@@ -97,12 +102,21 @@ function DesktopLayout({ symbol }: { symbol: string }) {
       </main>
 
       {rightPanelOpen ? (
-        <div className="flex w-80 flex-shrink-0 flex-col overflow-hidden" style={{ borderLeft: "1px solid var(--border)" }}>
-          <div className="min-h-0 flex-1 overflow-hidden" style={{ borderBottom: "1px solid var(--border)" }}>
-            <OrderBook symbol={symbol} onCollapse={() => toggle("rightPanelOpen")} />
+        <>
+          <ResizeHandle
+            orientation="vertical"
+            invert
+            ariaLabel="Resize order book"
+            getSize={() => useLayoutStore.getState().rightPanelWidth}
+            onResize={setRightPanelWidth}
+          />
+          <div className="flex flex-shrink-0 flex-col overflow-hidden" style={{ width: rightPanelWidth, borderLeft: "1px solid var(--border)" }}>
+            <div className="min-h-0 flex-1 overflow-hidden" style={{ borderBottom: "1px solid var(--border)" }}>
+              <OrderBook symbol={symbol} onCollapse={() => toggle("rightPanelOpen")} />
+            </div>
+            <div className="h-48 flex-shrink-0 overflow-hidden"><TradeList symbol={symbol} /></div>
           </div>
-          <div className="h-48 flex-shrink-0 overflow-hidden"><TradeList symbol={symbol} /></div>
-        </div>
+        </>
       ) : (
         <CollapsedRail label="Book & Trades" side="right" onExpand={() => toggle("rightPanelOpen")} />
       )}
@@ -161,8 +175,8 @@ function MobileLayout({ symbol }: { symbol: string }) {
 function CollapsedRail({ label, side, onExpand }: { label: string; side: "left" | "right"; onExpand: () => void }) {
   return (
     <div className="flex w-6 flex-shrink-0 flex-col items-center" style={{ background: "var(--bg-panel)", borderLeft: side === "right" ? "1px solid var(--border)" : undefined, borderRight: side === "left" ? "1px solid var(--border)" : undefined }}>
-      <button onClick={onExpand} className="icon-btn mt-1 h-5 w-5 text-[12px]" title={`Expand ${label}`}>
-        {side === "left" ? "›" : "‹"}
+      <button onClick={onExpand} className="icon-btn mt-1 h-6 w-6" title={`Expand ${label}`}>
+        {side === "left" ? <ChevronRightIcon size={14} /> : <ChevronLeftIcon size={14} />}
       </button>
       <div className="mt-2 select-none text-[9px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)", writingMode: "vertical-rl" }}>
         {label}

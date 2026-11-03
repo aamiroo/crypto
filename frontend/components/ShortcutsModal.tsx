@@ -2,6 +2,7 @@
 
 import { useUiStore } from "@/lib/store/uiStore";
 import { SHORTCUTS } from "@/lib/hooks/useKeyboardShortcuts";
+import { CloseIcon } from "@/components/icons/ToolIcons";
 
 export function ShortcutsModal() {
   const open = useUiStore((s) => s.shortcutsOpen);
@@ -24,7 +25,7 @@ export function ShortcutsModal() {
       >
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>Keyboard Shortcuts</h2>
-          <button onClick={() => setOpen(false)} className="icon-btn h-6 w-6 text-xs">✕</button>
+          <button onClick={() => setOpen(false)} className="icon-btn h-6 w-6" aria-label="Close"><CloseIcon size={13} /></button>
         </div>
         <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
           {SHORTCUTS.map((s) => (

@@ -8,6 +8,7 @@ import { useLayoutStore } from "@/lib/store/layoutStore";
 import { SymbolPicker } from "@/components/SymbolPicker";
 import { ConnectionStatus } from "@/components/ui/ConnectionStatus";
 import { Popover } from "@/components/ui/Popover";
+import { BellIcon, GearIcon, KeyboardIcon, LogoIcon, MoonIcon, SunIcon } from "@/components/icons/ToolIcons";
 
 export function TopBar() {
   const toggleTheme = useThemeStore((s) => s.toggle);
@@ -21,7 +22,9 @@ export function TopBar() {
   return (
     <header className="flex h-11 flex-shrink-0 items-center gap-2 border-b px-2 sm:px-3" style={{ background: "var(--bg-primary)", borderColor: "var(--border)" }}>
       <div className="flex items-center gap-2">
-        <div className="flex h-6 w-6 items-center justify-center rounded text-[11px] font-bold" style={{ background: "color-mix(in srgb, var(--accent) 20%, transparent)", color: "var(--accent)" }}>C</div>
+        <div className="flex h-6 w-6 items-center justify-center rounded" style={{ background: "color-mix(in srgb, var(--accent) 20%, transparent)", color: "var(--accent)" }}>
+          <LogoIcon size={15} />
+        </div>
         <span className="hidden text-xs font-semibold tracking-wide sm:inline" style={{ color: "var(--text-secondary)" }}>CRYPTO TERMINAL</span>
       </div>
       <div className="divider-v" />
@@ -30,20 +33,22 @@ export function TopBar() {
       <ConnectionStatus />
       <button
         onClick={() => setAlertsOpen(true)}
-        className="icon-btn relative h-7 w-7 text-[13px]"
+        className="icon-btn relative h-7 w-7"
         title="Price alerts"
         aria-label="Price alerts"
       >
-        🔔
+        <BellIcon size={15} />
         {activeAlerts > 0 && (
           <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-0.5 text-[8px] font-bold text-white" style={{ background: "var(--accent)" }}>
             {activeAlerts}
           </span>
         )}
       </button>
-      <button onClick={toggleShortcuts} className="icon-btn hidden h-7 w-7 text-[12px] sm:flex" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">⌨</button>
-      <button onClick={toggleTheme} className="icon-btn h-7 w-7 text-[13px]" title="Toggle theme" aria-label="Toggle theme">{theme === "dark" ? "☀" : "☾"}</button>
-      <Popover label="⚙" tooltip="Settings & data source" className="icon-btn h-7 w-7 text-[13px]" align="right" width={240}>
+      <button onClick={toggleShortcuts} className="icon-btn hidden h-7 w-7 sm:flex" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts"><KeyboardIcon size={15} /></button>
+      <button onClick={toggleTheme} className="icon-btn h-7 w-7" title="Toggle theme" aria-label="Toggle theme">
+        {theme === "dark" ? <SunIcon size={15} /> : <MoonIcon size={15} />}
+      </button>
+      <Popover label={<GearIcon size={15} />} tooltip="Settings & data source" className="icon-btn h-7 w-7" align="right" width={240}>
         {(close) => <SettingsBody close={close} />}
       </Popover>
     </header>

@@ -44,6 +44,7 @@ export function OrderBook({ symbol, onCollapse }: { symbol: string; onCollapse?:
   return (
     <Panel
       title="Order Book"
+      side="right"
       onCollapse={onCollapse}
       right={
         <div className="flex items-center gap-0.5">

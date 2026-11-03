@@ -6,6 +6,7 @@ import { useAlertsStore, conditionLabel } from "@/lib/store/alertsStore";
 import { useMarketStore } from "@/lib/store/marketStore";
 import { fmtPrice, fmtTime } from "@/lib/utils/format";
 import { baseAsset } from "@/lib/utils/symbol";
+import { CloseIcon } from "@/components/icons/ToolIcons";
 import type { AlertCondition } from "@/lib/types";
 
 export function AlertsPanel() {
@@ -49,7 +50,7 @@ export function AlertsPanel() {
       >
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>Price Alerts</h2>
-          <button onClick={() => setOpen(false)} className="icon-btn h-6 w-6 text-xs">✕</button>
+          <button onClick={() => setOpen(false)} className="icon-btn h-6 w-6" aria-label="Close alerts"><CloseIcon size={13} /></button>
         </div>
 
         <div className="mb-3 rounded-lg p-2" style={{ background: "var(--bg-surface)" }}>
@@ -98,7 +99,7 @@ export function AlertsPanel() {
                 {a.triggeredAt && (
                   <span className="text-[9px]" style={{ color: "var(--warning)" }} title={`Fired ${fmtTime(a.triggeredAt)}`}>fired</span>
                 )}
-                <button onClick={() => removeAlert(a.id)} className="icon-btn h-5 w-5 text-[10px]" title="Remove alert">✕</button>
+                <button onClick={() => removeAlert(a.id)} className="icon-btn h-5 w-5" title="Remove alert" aria-label="Remove alert"><CloseIcon size={11} /></button>
               </div>
             ))
           )}

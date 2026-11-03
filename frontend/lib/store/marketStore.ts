@@ -7,17 +7,25 @@ import {
   EMPTY_KLINES, MAX_KLINES, isCurrentBar, klineKey, mergeKlines, mergeRawKline, normalizeKlines,
 } from "@/lib/utils/klines";
 import type { CandlePrecedence } from "@/lib/utils/klines";
-import { setInstruments } from "@/lib/utils/symbol";
+import { normalizeSymbol, setInstruments } from "@/lib/utils/symbol";
 
 /** Orderbook stored as maps for O(1) delta apply */
 interface OrderBookState { bids: Map<string, string>; asks: Map<string, string>; }
 
 export type KlineState = "idle" | "loading" | "ready" | "error";
-export interface KlineStatus { state: KlineState; error?: string; }
+/** `historyStatus` is the gateway's own crawl state for this window (`crawling`,
+ *  `waiting`, `exhausted`, `complete`, `idle`) — it is what lets the chart say
+ *  "the exchange is not answering" instead of promising a refill that will never
+ *  arrive. */
+export interface KlineStatus { state: KlineState; error?: string; historyStatus?: string; }
 
 interface MarketState {
   symbol: string;
   symbols: string[];
+  /** symbol -> venue tick/lot decimals. `symbol.ts` answers from the same data but
+   *  is not reactive; the chart axis has to follow this instead, because on a cold
+   *  boot the instruments envelope lands after the first candles are already drawn. */
+  instrumentDecimals: Record<string, { price: number; qty: number }>;
   orderBooks: Record<string, OrderBookState>;
   recentTrades: Record<string, TradeData[]>;
   klines: Record<string, Record<string, KlineData[]>>;  // symbol -> interval -> klines
@@ -29,7 +37,7 @@ interface MarketState {
 
   setSymbol: (s: string) => void;
   setConnected: (c: boolean) => void;
-  setKlineStatus: (symbol: string, interval: string, state: KlineState, error?: string) => void;
+  setKlineStatus: (symbol: string, interval: string, state: KlineState, error?: string, historyStatus?: string) => void;
   mergeKlinesInto: (symbol: string, interval: string, incoming: KlineData[], restTickCursor?: number) => void;
   applyEnvelope: (env: Envelope) => void;
 }
@@ -80,6 +88,7 @@ function readStoredSymbol(): string {
 export const useMarketStore = create<MarketState>((set, get) => ({
   symbol: readStoredSymbol(),
   symbols: [],
+  instrumentDecimals: {},
   orderBooks: {},
   recentTrades: {},
   klines: {},
@@ -91,8 +100,8 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   setSymbol: (symbol) => { if (typeof window !== "undefined") localStorage.setItem("ct_sym", symbol); set({ symbol }); },
   setConnected: (connected) => set({ connected }),
 
-  setKlineStatus: (symbol, interval, state, error) =>
-    set((st) => ({ klineStatus: { ...st.klineStatus, [klineKey(symbol, interval)]: { state, error } } })),
+  setKlineStatus: (symbol, interval, state, error, historyStatus) =>
+    set((st) => ({ klineStatus: { ...st.klineStatus, [klineKey(symbol, interval)]: { state, error, historyStatus } } })),
 
   mergeKlinesInto: (symbol, interval, incoming, restTickCursor) =>
     set((st) => {
@@ -117,7 +126,11 @@ export const useMarketStore = create<MarketState>((set, get) => ({
       const instruments = data?.instruments;
       if (Array.isArray(instruments)) {
         setInstruments(instruments);
-        set({ symbols: instruments.map((i) => i.symbol) });
+        const decimals: Record<string, { price: number; qty: number }> = {};
+        for (const i of instruments) {
+          decimals[normalizeSymbol(i.symbol)] = { price: i.priceDecimals, qty: i.qtyDecimals };
+        }
+        set({ symbols: instruments.map((i) => i.symbol), instrumentDecimals: decimals });
       }
       return;
     }
@@ -258,6 +271,59 @@ export function selectKlines(state: MarketState, symbol: string, interval: strin
 }
 
 /**
+ * The pairs actually worth looking at, most traded first.
+ *
+ * An exchange's own listing order is a catalogue, not a ranking: it puts a coin
+ * that has not traded in a week next to the market's deepest book, so a default
+ * view built from it shows one live market and thirty strangers. Quote turnover
+ * is the comparison that means something across pairs — a base-asset volume of
+ * 3,000 is nothing on BTC and enormous on a meme coin — and `volume24h` is the
+ * fallback for venues that do not report turnover.
+ *
+ * Symbols the ticker feed has not reached yet rank last, so a cold store returns
+ * the catalogue order rather than inventing a ranking it cannot see.
+ */
+export function mostLiquid(
+  symbols: string[],
+  tickers: Record<string, TickerData>,
+  count: number,
+): string[] {
+  /** Ranked once per call rather than per comparison: a sort would otherwise
+   *  parse the same field thousands of times across 400 symbols. */
+  const rank = new Map<string, number>();
+  for (const s of symbols) {
+    const t = tickers[s];
+    const v = t ? parseFloat(t.turnover24h ?? t.volume24h) : NaN;
+    rank.set(s, Number.isFinite(v) ? v : -1);
+  }
+  return [...symbols].sort((a, b) => (rank.get(b) ?? -1) - (rank.get(a) ?? -1)).slice(0, count);
+}
+
+/** Same inputs -> the same array, by identity. */
+let liquidMemo: { symbols: string[]; known: number; out: string[] } | null = null;
+
+/**
+ * `mostLiquid` for a component to select on.
+ *
+ * The feed rewrites the ticker map several times a second, and a ranking that
+ * followed every flush would shuffle the default watchlist out from under the
+ * pointer. So the order is only recomputed when the *set* of symbols or the set
+ * of priced pairs changes — which is the same identity-as-version-stamp trick
+ * `selectDepth` uses, but with one entry instead of a WeakMap.
+ */
+export function topLiquid(
+  symbols: string[],
+  tickers: Record<string, TickerData>,
+  count: number,
+): string[] {
+  const known = Object.keys(tickers).length;
+  if (liquidMemo && liquidMemo.symbols === symbols && liquidMemo.known === known) return liquidMemo.out;
+  const out = mostLiquid(symbols, tickers, count);
+  liquidMemo = { symbols, known, out };
+  return out;
+}
+
+/**
  * Sorted top-N bids/asks.
  * The result is memoized per book object, so a component can select it without
  * producing a fresh array (and an infinite re-render loop) on every store
@@ -275,7 +341,7 @@ const depthCache = new WeakMap<OrderBookState, Map<number, DepthView>>();
 /** Two-level cache keyed on book identity then depth. Every delta installs a
  *  new book object, so the WeakMap entry drops itself — no manual invalidation,
  *  and different depths never recompute the same sort. */
-export function selectDepth(state: MarketState, symbol: string, depth = 25): DepthView {
+export function selectDepth(state: MarketState, symbol: string, depth = 50): DepthView {
   const book = state.orderBooks[symbol];
   if (!book) return EMPTY_DEPTH;
   let perDepth = depthCache.get(book);

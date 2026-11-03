@@ -16,7 +16,9 @@ import { Instruments } from "../backend/src/instruments.js";
 
 const silentLogger = { info() {}, warn() {}, error() {} };
 const MIN = 60_000;
-const BASE = 1_700_000_000_000;
+/** On the minute grid, because that is where a real 1 m bar opens: a row that is
+ *  not on its interval's grid is not a candle and the gateway now drops it. */
+const BASE = Math.floor(1_700_000_000_000 / MIN) * MIN;
 
 function instruments() {
   const inst = new Instruments({ logger: silentLogger, quote: "USDT" });

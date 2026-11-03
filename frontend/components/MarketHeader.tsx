@@ -37,15 +37,23 @@ export function MarketHeader({ symbol }: { symbol: string }) {
     <div className="no-select flex flex-shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b px-3 py-2" style={{ borderColor: "var(--border)", background: "var(--bg-primary)" }}>
       <div className="flex items-center gap-2">
         <CoinIcon symbol={symbol} size="md" />
-        <span className="text-sm font-bold" style={{ color: "var(--text-primary)" }}>{baseAsset(symbol)}</span>
-        <span className="text-xs" style={{ color: "var(--text-muted)" }}>/ USDT</span>
+        <span className="text-[13px] font-bold tracking-wide" style={{ color: "var(--text-secondary)" }}>{baseAsset(symbol)}</span>
+        <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>/ USDT</span>
       </div>
 
       {ticker ? (
         <>
+          {/* The last price is the one number a trader scans for, so it is by far
+              the largest thing in the header; before, it was 16px against a 14px
+              pair name and read as just another stat. */}
           <div className="flex items-baseline gap-2">
-            <span ref={flashRef} className="text-base font-semibold tabular-nums" style={{ color }}>{fmtPrice(ticker.lastPrice, symbol)}</span>
-            <span className="text-xs font-medium tabular-nums" style={{ color }}>{fmtPct(change)}</span>
+            <span ref={flashRef} className="text-[22px] font-bold leading-none tracking-tight tabular-nums" style={{ color }}>{fmtPrice(ticker.lastPrice, symbol)}</span>
+            <span
+              className="rounded px-1.5 py-0.5 text-[11px] font-semibold tabular-nums"
+              style={{ color, background: `color-mix(in srgb, ${color} 14%, transparent)` }}
+            >
+              {fmtPct(change)}
+            </span>
           </div>
           <div className="hidden items-center gap-3 text-[11px] md:flex">
             <Stat label="24h High" value={fmtPrice(ticker.high24h, symbol)} />

@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,9 @@ import { Instruments } from "../backend/src/instruments.js";
 const silentLogger = { info() {}, warn() {}, error() {} };
 const MIN = 60_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const BASE = 1_700_000_000_000;
+/** Anchored to the minute the way a real 1 m bar is: an openTime that is not on
+ *  the interval's own grid is not a candle, and the mirror now rejects it. */
+const BASE = Math.floor(1_700_000_000_000 / MIN) * MIN;
 
 function instruments() {
   const inst = new Instruments({ logger: silentLogger, quote: "USDT" });
@@ -47,7 +49,14 @@ function candle(n: number, closed = true) {
   };
 }
 
-const NOW = Math.floor(Date.now() / MIN) * MIN;
+/** The minute the tests think the market is in. Re-armed for every test, because
+ *  a live window earns the right to answer a "what is recent" read from the bars
+ *  it holds — a suite that sat on the present minute captured at module load
+ *  would have those windows stop counting as live two minutes into a long run,
+ *  and the failure would depend on how late the file happened to start. */
+let NOW = Math.floor(Date.now() / MIN) * MIN;
+beforeEach(() => { NOW = Math.floor(Date.now() / MIN) * MIN; });
+
 /** A bar `n` minutes before the present. Only a window that still reaches the
  *  present may answer a "what is recent" read once it has been read back from
  *  disk, so the tests that restore one use these instead of the 2023 fixtures. */
@@ -79,10 +88,14 @@ async function withVenueStub<T>(handler: (url: string) => Promise<StubReply>, ru
 const noCrawl = { trigger() { return false; }, stop() {} };
 
 async function startGateway(store: ReturnType<typeof createKlinesStore>, crawler = noCrawl) {
-  const { server } = createGateway(instruments(), ["bybit"], silentLogger, null, store, crawler);
+  const k = createGateway(instruments(), ["bybit"], silentLogger, null, store, crawler);
+  const server = k.server;
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   return {
     base: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    // The upstream lane's own counters, so the priority rule can be asserted
+    // rather than inferred from a timing window.
+    lane: k.klineLane,
     close: () => new Promise<void>((r) => { server.close(() => r()); }),
   };
 }
@@ -269,21 +282,21 @@ test("klines store: the disk mirror round-trips a window and skips junk", async 
 test("klines store: streamed candles keep the fallback window at now", () => {
   const store = tmpStore("f");
   // The last page REST served before the venue went unreachable.
-  store.remember("BTCUSDT", "1m", [candle(1), candle(2)]);
+  store.remember("BTCUSDT", "1m", [liveCandle(3), liveCandle(2)]);
 
   // The websocket keeps delivering: the forming candle updates in place, the next
   // one opens a new slot. Without this the mirror ages by the minute and every
   // fallback answer leaves the chart's right edge frozen hours behind.
-  store.append("BTCUSDT", "1m", candle(2, false));
-  store.append("BTCUSDT", "1m", { ...candle(2, false), close: "100.9", volume: "9" });
-  store.append("BTCUSDT", "1m", candle(3, false));
-  store.append("BTCUSDT", "1m", { ...candle(3, false), volume: "-5" });
+  store.append("BTCUSDT", "1m", liveCandle(2));
+  store.append("BTCUSDT", "1m", { ...liveCandle(2), close: "100.9", volume: "9" });
+  store.append("BTCUSDT", "1m", liveCandle(1));
+  store.append("BTCUSDT", "1m", { ...liveCandle(1), volume: "-5" });
   store.append("BTCUSDT", "1m", { openTime: 0, open: "1", high: "1", low: "1", close: "1", volume: "1" });
-  store.append("BTCUSDT", "1m", { openTime: BASE + 4 * MIN, open: "x", high: "1", low: "1", close: "1", volume: "1" });
+  store.append("BTCUSDT", "1m", { openTime: NOW - 5 * MIN, open: "x", high: "1", low: "1", close: "1", volume: "1" });
 
   const back = store.candles("BTCUSDT", "1m", 500)!;
   assert.equal(back.length, 3, "one candle per slot, junk rejected");
-  assert.equal(Number(back[2]!.openTime), BASE + 3 * MIN);
+  assert.equal(Number(back[2]!.openTime), NOW - MIN);
   assert.equal(back[2]!.volume, "7", "a negative volume must not blank the live bar");
   assert.equal(back[1]!.close, "100.9", "the last good update survives the junk ones");
   assert.equal(store.venueBacked("BTCUSDT", "1m"), true, "stream ticks on top of a real page keep it real history");
@@ -376,7 +389,7 @@ test("gateway: the refresh tick queues no probes for a window that refused us", 
 
 test("gateway: after a refusal the window is harvested again once the venue recovers", async () => {
   const store = tmpStore("i");
-  store.remember("BTCUSDT", "1m", [candle(1), candle(2)]);
+  store.remember("BTCUSDT", "1m", [liveCandle(3), liveCandle(2)]);
   await withKlineTiming({ refreshMs: "10", coolMs: "30", circuitMs: "0" }, async () => {
     const g = await startGateway(store);
     try {
@@ -384,24 +397,25 @@ test("gateway: after a refusal the window is harvested again once the venue reco
       const reply = async (): Promise<StubReply> => {
         if (!allow) return blocked();
         return { ok: true, status: 200, json: async () => ({ retCode: 0, result: { list: [
-          [String(BASE + 3 * MIN), "1", "2", "0.5", "1.5", "3"],
-          [String(BASE + 2 * MIN), "1", "2", "0.5", "1.5", "3"],
-          [String(BASE + 1 * MIN), "1", "2", "0.5", "1.5", "3"],
-          [String(BASE + 0 * MIN), "1", "2", "0.5", "1.5", "3"],
+          [String(NOW), "1", "2", "0.5", "1.5", "3"],
+          [String(NOW - MIN), "1", "2", "0.5", "1.5", "3"],
+          [String(NOW - 2 * MIN), "1", "2", "0.5", "1.5", "3"],
+          [String(NOW - 3 * MIN), "1", "2", "0.5", "1.5", "3"],
         ] } }) };
       };
       const seen = await withVenueStub(reply, async () => {
         const w = await watchKline(g, "BTCUSDT", "1m");
-        await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=500`);
-        await sleep(200);          // refused: the window goes cool
-        allow = true;              // the venue starts answering
-        for (let i = 0; i < 60 && store.candles("BTCUSDT", "1m", 500)!.length < 4; i++) await sleep(20);
-        // A different depth: the 2 s read cache may still hold the pre-recovery
-        // answer, and this asserts on what the recovery put in the mirror.
-        const res = await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=499`);
-        const body = await res.json() as { data?: unknown[] };
-        w.close();
-        return body.data?.length ?? 0;
+        try {
+          await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=500`);
+          await sleep(200);          // refused: the window goes cool
+          allow = true;              // the venue starts answering
+          await until(() => (store.candles("BTCUSDT", "1m", 500)?.length ?? 0) >= 4, 3000, "the recovered page to reach the mirror");
+          // A different depth: the 2 s read cache may still hold the pre-recovery
+          // answer, and this asserts on what the recovery put in the mirror.
+          const res = await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=499`);
+          const body = await res.json() as { data?: unknown[] };
+          return body.data?.length ?? 0;
+        } finally { w.close(); }
       });
       assert.equal(seen, 4, "a recovered venue is harvested again after the cool-off");
       assert.equal(store.venueBacked("BTCUSDT", "1m"), true);
@@ -445,6 +459,49 @@ test("gateway: a page the venue served is reported as real history", async () =>
   } finally { await g.close(); }
 });
 
+/** What a client can conclude about *this page* is not only "how many bars":
+ *  a time axis paints absent minutes as if they were there, so the two things a
+ *  chart cannot see for itself — that the right edge is not the present, and that
+ *  a run of candles is missing inside the window — have to arrive in `meta`. */
+test("gateway: a window that is behind says so on the wire", async () => {
+  const store = tmpStore("p4");
+  // The mirror as it looks after an outage: the newest bars it holds are from
+  // before it, and a blocked venue means that is all the chart can get.
+  store.remember("BTCUSDT", "1m", [candle(1), candle(2)]);
+  const g = await startGateway(store);
+  try {
+    const body = await withVenueStub(blocked, async () => {
+      const res = await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=500`);
+      const json = await res.json() as {
+        data?: unknown[];
+        meta?: { history?: { current?: boolean; gap?: { bars: number; from: number } | null } };
+      };
+      await sleep(150); // the revalidation behind that answer lands on this stub, not the next test's
+      return json;
+    });
+    assert.equal((body.data ?? []).length, 2, "the last bars it holds are still handed over");
+    assert.equal(body.meta?.history?.current, false, "and the page admits that they are not the present");
+    assert.ok((body.meta?.history?.gap?.bars ?? 0) > 0, "with the size of the run the mirror never got");
+    assert.equal(body.meta?.history?.gap?.from, BASE + 3 * MIN, "starting at the first slot after the newest bar held");
+  } finally { await g.close(); }
+});
+
+test("gateway: a window that reaches the present reports nothing missing", async () => {
+  const store = tmpStore("p5");
+  store.remember("BTCUSDT", "1m", [liveCandle(2), liveCandle(1), liveCandle(0)]);
+  const g = await startGateway(store);
+  try {
+    const body = await withVenueStub(blocked, async () => {
+      const res = await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=500`);
+      const json = await res.json() as { meta?: { history?: { current?: boolean; gap?: unknown } } };
+      await sleep(150);
+      return json;
+    });
+    assert.equal(body.meta?.history?.current, true, "the live edge is claimed only when the bars earn it");
+    assert.equal(body.meta?.history?.gap, null, "and a chart with nothing absent gets no warning");
+  } finally { await g.close(); }
+});
+
 test("gateway: a cooled window says it cannot go deeper", async () => {
   const store = tmpStore("p3");
   store.remember("BTCUSDT", "1m", [candle(1), candle(2)]);
@@ -480,11 +537,11 @@ test("store: an older page deepens the mirror but never becomes the live window"
 
 test("store: the live refresh keeps the depth scroll-back collected", () => {
   const store = tmpStore("m5");
-  store.rememberOlder("BTCUSDT", "1m", Array.from({ length: 400 }, (_, i) => candle(i)));
-  store.remember("BTCUSDT", "1m", [candle(500), candle(501)]);
+  store.rememberOlder("BTCUSDT", "1m", Array.from({ length: 400 }, (_, i) => liveCandle(500 - i)));
+  store.remember("BTCUSDT", "1m", [liveCandle(2), liveCandle(1)]);
   assert.equal(store.candles("BTCUSDT", "1m", 1000)!.length, 402, "a 30s refresh must not truncate the mirror back to one page");
-  assert.equal(store.candles("BTCUSDT", "1m", 1000)![401]!.openTime, BASE + 501 * MIN, "the newest bar is still the tail");
-  assert.equal(store.candlesBefore("BTCUSDT", "1m", BASE + 100 * MIN, 100)!.length, 100, "history stays reachable");
+  assert.equal(store.candles("BTCUSDT", "1m", 1000)![401]!.openTime, NOW - MIN, "the newest bar is still the tail");
+  assert.equal(store.candlesBefore("BTCUSDT", "1m", NOW - 301 * MIN, 100)!.length, 100, "history stays reachable");
 });
 
 test("store: the depth policy is one table an operator can restate", () => {
@@ -506,12 +563,12 @@ test("store: the window depth budget keeps the newest candles", () => {
   // window, never an unbounded pile.
   const store = tmpStore("m6", { depthTargets: { "1m": 3000 } });
   assert.equal(store.progress("BTCUSDT", "1m").target, 3000, "the override is what the window works toward");
-  store.rememberOlder("BTCUSDT", "1m", Array.from({ length: 3000 }, (_, i) => candle(i)));
-  store.remember("BTCUSDT", "1m", Array.from({ length: 1000 }, (_, i) => candle(3000 + i)));
+  store.rememberOlder("BTCUSDT", "1m", Array.from({ length: 3000 }, (_, i) => liveCandle(4000 - i)));
+  store.remember("BTCUSDT", "1m", Array.from({ length: 1000 }, (_, i) => liveCandle(1000 - i)));
   const all = store.candles("BTCUSDT", "1m", 5000)!;
   assert.equal(all.length, 3000, "the depth target is a sliding budget");
-  assert.equal(all[0]!.openTime, BASE + 1000 * MIN, "the oldest thousand are dropped");
-  assert.equal(all[2999]!.openTime, BASE + 3999 * MIN);
+  assert.equal(all[0]!.openTime, NOW - 3000 * MIN, "the oldest thousand are dropped");
+  assert.equal(all[2999]!.openTime, NOW - MIN);
   assert.equal(store.progress("BTCUSDT", "1m").bars, 3000, "the depth count is what a crawl works toward");
 });
 
@@ -552,18 +609,18 @@ test("gateway: a mirror that runs shallow reports the shortfall, not the end of 
 
 test("gateway: an older venue page is mirrored, so the next page is local", async () => {
   const store = tmpStore("m4");
-  store.remember("BTCUSDT", "1m", [candle(2000), candle(2001)]);
+  store.remember("BTCUSDT", "1m", [liveCandle(2), liveCandle(1)]);
   const olderPage = async (): Promise<StubReply> => ({
     ok: true, status: 200,
     json: async () => ({ retCode: 0, result: { list: [
-      [String(BASE + 1002 * MIN), "1", "2", "0.5", "1.5", "3"],
-      [String(BASE + 1001 * MIN), "1", "2", "0.5", "1.5", "3"],
-      [String(BASE + 1000 * MIN), "1", "2", "0.5", "1.5", "3"],
+      [String(NOW - 1500 * MIN), "1", "2", "0.5", "1.5", "3"],
+      [String(NOW - 1501 * MIN), "1", "2", "0.5", "1.5", "3"],
+      [String(NOW - 1502 * MIN), "1", "2", "0.5", "1.5", "3"],
     ] } }),
   });
   const g = await startGateway(store);
   try {
-    const end = BASE + 1500 * MIN;
+    const end = NOW - 1400 * MIN;
     let calls = 0;
     const first = await withVenueStub(async () => { calls += 1; return olderPage(); },
       () => fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=1m&limit=3&endTime=${end}`));
@@ -580,7 +637,7 @@ test("gateway: an older venue page is mirrored, so the next page is local", asyn
     assert.equal(store.candlesBefore("BTCUSDT", "1m", end, 10)!.length, 3, "and stayed in the window it belongs to");
     const tail = store.candles("BTCUSDT", "1m", 10)!;
     assert.equal(tail.length, 5, "the backfilled bars join the same window");
-    assert.equal(tail[4]!.openTime, BASE + 2001 * MIN, "the newest live bar is still the tail");
+    assert.equal(tail[4]!.openTime, NOW - MIN, "the newest live bar is still the tail");
     assert.equal(new Set(tail.map((c) => c.openTime)).size, tail.length, "no bar is held twice");
   } finally { await g.close(); }
 });
@@ -703,4 +760,101 @@ test("gateway: a venue that ends the range stops the crawl and the scroll-back",
       assert.equal(b.meta.canGoOlder, false, "and the client is told to stop scrolling back");
     });
   } finally { await g.close(); }
+});
+
+/* ── the two-priority lane ────────────────────────────────────────────── */
+
+/** Bybit's period code → its own candle grid, so a stub can generate rows the
+ *  store's alignment check accepts. */
+const BYBIT_STEP_MS: Record<string, number> = {
+  "1": 60_000, "3": 180_000, "5": 300_000, "15": 900_000, "30": 1_800_000, "60": 3_600_000,
+};
+
+/** A healthy venue: whatever period it is asked for, it fills from a
+ *  grid-aligned history ending now, newest-first. Nothing here opens a cool-off,
+ *  so the lane keeps having real work to schedule — which is the only way to
+ *  observe who it sends first. */
+function venueLive() {
+  const sends: { at: number; interval: string | null; symbol: string | null }[] = [];
+  const handler = async (url: string): Promise<StubReply> => {
+    const u = new URL(url);
+    sends.push({ at: Date.now(), interval: u.searchParams.get("interval"), symbol: u.searchParams.get("symbol") });
+    const stepMs = BYBIT_STEP_MS[u.searchParams.get("interval") ?? "1"] ?? 60_000;
+    const limit = Number(u.searchParams.get("limit"));
+    const top = Math.floor(Date.now() / stepMs) * stepMs;
+    const list: string[][] = [];
+    for (let i = 0; i < limit; i++) {
+      list.push([String(top - i * stepMs), "1", "2", "0.5", "1.5", "3"]);
+    }
+    return { ok: true, status: 200, json: async () => ({ retCode: 0, result: { list } }) };
+  };
+  return { sends, handler };
+}
+
+/** Six watched pairs, which is six background pages the selection pre-warm puts
+ *  into the lane at once: the queue a chart used to sit behind. */
+const SIX_PAIRS: [string, string][] = [
+  ["BTCUSDT", "1m"], ["BTCUSDT", "3m"], ["BTCUSDT", "5m"],
+  ["ETHUSDT", "1m"], ["ETHUSDT", "3m"], ["ETHUSDT", "5m"],
+];
+
+test("lane: a client's own read overtakes the background probes queued in front of it", async () => {
+  const store = tmpStore("lane-priority", { depthTargets: { "1m": 1200 } });
+  const g = await startGateway(store);
+  const v = venueLive();
+  try {
+    const out = await withVenueStub(v.handler, async () => {
+      // In parallel on purpose: the pre-warm fires the whole demand set per
+      // message, so all six keys are in the lane while the sockets come up.
+      const watchers = await Promise.all(
+        SIX_PAIRS.map(([sym, iv]) => watchKline(g, sym, iv)),
+      );
+      const t0 = Date.now();
+      // A period nobody is pre-warming, so this read genuinely needs the slot.
+      const res = await fetch(`${g.base}/api/klines?symbol=BTCUSDT&interval=15m&limit=500`);
+      const elapsed = Date.now() - t0;
+      const body = await res.json() as { data?: unknown[] };
+      await sleep(1500); // let the rest of the background work drain
+      for (const w of watchers) w.close();
+      return { elapsed, rows: body.data?.length ?? 0, stats: g.lane() };
+    });
+    assert.equal(out.rows, 500, "the client still gets the page it asked for");
+
+    const clientSend = v.sends.findIndex((s) => s.interval === "15");
+    assert.ok(clientSend >= 0, "the client's page went upstream");
+    assert.ok(clientSend <= 2,
+      `the interactive request must be at the front of the lane, was send #${clientSend + 1} of ${v.sends.length}`);
+    // Yielding is not dropping: every watched pair still got its background
+    // page, however many times the pre-warm re-fired it.
+    const sent = new Set(v.sends.map((s) => `${s.symbol}:${s.interval}`));
+    assert.equal(sent.size, SIX_PAIRS.length + 1, "all six pre-warmed periods plus the client's own were sent");
+    assert.ok(out.elapsed < 600, `the chart must not wait out the crawl queue, took ${out.elapsed}ms`);
+    assert.ok(out.stats.yielded >= 1, "the lane recorded that it sent a client request over queued background work");
+
+    // Venue-friendly rate limiting survives the reordering: no two sends closer
+    // than the lane's minimum spacing (timers allow a millisecond of slack).
+    const gaps = v.sends.slice(1).map((s, i) => s.at - v.sends[i].at);
+    assert.ok(Math.min(...gaps) >= 120,
+      `sends must stay spaced apart, closest pair was ${Math.min(...gaps)}ms apart`);
+  } finally { await g.close(); }
+});
+
+test("lane: a closing gateway retires its queued retries instead of spending them", async () => {
+  const store = tmpStore("lane-stop", { depthTargets: { "1m": 1200 } });
+  const g = await startGateway(store);
+  const v = venueLive();
+  // The bug this pins: a probe whose attempt was parked in the lane kept its
+  // remaining retries after the server closed, so a gateway that no client can
+  // reach still sent upstream traffic — and in a suite, into somebody else's
+  // stub. Under load that is an unattributable call and a flaky count.
+  const n = await withVenueStub(v.handler, async () => {
+    const watchers = await Promise.all(SIX_PAIRS.map(([sym, iv]) => watchKline(g, sym, iv)));
+    for (const w of watchers) w.close();
+    await sleep(50);           // the pre-warm is queued, the venue is not done with it
+    await g.close();           // the gateway is gone mid-queue
+    const after = v.sends.length;
+    await sleep(1200);         // the old code spent its retries in this window
+    return { before: after, total: v.sends.length };
+  });
+  assert.equal(n.total, n.before, "a closed gateway sends nothing more");
 });

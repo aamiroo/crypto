@@ -4,7 +4,7 @@ import { useChartStore, selectDrawings } from "@/lib/store/chartStore";
 import { useUiStore } from "@/lib/store/uiStore";
 import { TYPE_LABEL, positionMetrics } from "@/lib/utils/drawings";
 import { fmtPrice } from "@/lib/utils/format";
-import { EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
+import { CloseIcon, EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
 import type { Drawing } from "@/lib/types";
 
 /**
@@ -22,13 +22,13 @@ export function DrawingsPanel({ symbol }: { symbol: string }) {
   if (!open) return null;
 
   return (
-    <div className="glass-card absolute right-2 top-8 z-30 flex max-h-[46vh] w-60 flex-col overflow-hidden" data-draw-ui>
+    <div className="floating-panel absolute right-2 top-8 z-30 flex max-h-[46vh] w-60 flex-col overflow-hidden" data-draw-ui>
       <div className="flex flex-shrink-0 items-center justify-between px-2.5 py-1.5" style={{ borderBottom: "1px solid var(--border)" }}>
         <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>
           Drawings · {drawings.length}
         </span>
-        <button onClick={() => setOpen(false)} className="icon-btn h-5 w-5 text-[11px]" title="Close list" aria-label="Close drawings list">
-          ✕
+        <button onClick={() => setOpen(false)} className="icon-btn h-5 w-5" title="Close list" aria-label="Close drawings list">
+          <CloseIcon size={11} />
         </button>
       </div>
 

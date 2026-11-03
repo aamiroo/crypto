@@ -1,6 +1,4 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 html, body { height: 100%; overflow: hidden; }
 #__next { height: 100%; }
@@ -8,6 +6,10 @@ html, body { height: 100%; overflow: hidden; }
 /* ── Theme tokens ─────────────────────────────────────────── */
 :root,
 [data-theme="dark"] {
+  /* Single source for typography: the canvas chart reads these through
+     lib/chart/theme.ts, so the chart's labels and the DOM's labels can no longer
+     drift into two different type systems. */
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --bg-primary: #0b0e11;
   --bg-panel: #0f1216;
   --bg-elevated: #12161b;
@@ -15,7 +17,10 @@ html, body { height: 100%; overflow: hidden; }
   --bg-hover: #1d222a;
   --border: #1c2027;
   --border-strong: #2a303a;
-  --border-focus: #f59e0b;
+  /* Focus is a separate hue from --accent: an amber ring was indistinguishable
+     from "this control is active", so keyboard users could not tell selection
+     from focus at a glance. */
+  --border-focus: #4c8dff;
   --text-primary: #ecedef;
   --text-secondary: #a6adb8;
   --text-muted: #6b7280;
@@ -29,7 +34,10 @@ html, body { height: 100%; overflow: hidden; }
   --accent-contrast: #1a1200;
   --success: #10b981;
   --danger: #f43f5e;
-  --warning: #f59e0b;
+  /* Orange, not the amber of --accent: "stale feed", "reconnecting" and
+     "waiting for connection" all render with this, and in amber they were
+     indistinguishable from a control the user had actively selected. */
+  --warning: #f97316;
   --info: #3b82f6;
   --shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
@@ -42,7 +50,7 @@ html, body { height: 100%; overflow: hidden; }
   --bg-hover: #e4e8ed;
   --border: #dde2e8;
   --border-strong: #c6cdd6;
-  --border-focus: #d97706;
+  --border-focus: #2563eb;
   --text-primary: #16181d;
   --text-secondary: #4b5563;
   --text-muted: #8b93a1;
@@ -56,7 +64,7 @@ html, body { height: 100%; overflow: hidden; }
   --accent-contrast: #ffffff;
   --success: #12b886;
   --danger: #e03131;
-  --warning: #d97706;
+  --warning: #c2410c;
   --info: #2563eb;
   --shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
 }
@@ -64,7 +72,7 @@ html, body { height: 100%; overflow: hidden; }
 body {
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-ui);
   font-feature-settings: "tnum" 1, "cv01" 1;
   -webkit-font-smoothing: antialiased;
 }
@@ -137,18 +145,37 @@ body {
 
 .divider-v { width: 1px; align-self: stretch; margin: 5px 3px; background: var(--border); }
 
+/* Text buttons (retry, dialog actions). One class instead of the per-panel
+   border-radius/padding variants that had drifted apart. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.btn-sm { padding: 2px 8px; font-size: 10px; }
+
 /* ── Drawing tool rail ────────────────────────────────────── */
-/* A recessed glass strip: the rail reads as one control, and the armed tool
-   gets a lit pill instead of the old flat tint that was hard to notice. */
+/* A recessed, solid strip: the rail reads as one control that is part of the
+   toolbar, and the armed tool gets a lit pill instead of the old flat tint that
+   was hard to notice. Solid because a blurred, translucent strip floating over
+   the chart was the main source of the "this is a screenshot of a UI" feeling. */
 .tool-rail {
   display: flex;
   align-items: center;
   gap: 2px;
   padding: 2px;
   border-radius: 9px;
-  background: color-mix(in srgb, var(--bg-surface) 70%, transparent);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
-  backdrop-filter: blur(6px);
 }
 .rail-btn {
   position: relative;
@@ -227,56 +254,21 @@ body {
   color: var(--text-muted);
 }
 
-/* Armed-tool status strip over the chart: the toolbar clips anything that
-   hangs below it, so the live state and its controls live here instead. */
-.armed-strip {
-  position: absolute;
-  bottom: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 20;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 3px 8px;
-  font-size: 10px;
-  white-space: nowrap;
-}
-.armed-strip button {
-  padding: 1px 5px;
-  border-radius: 5px;
-  color: var(--text-muted);
-}
-.armed-strip button:hover { background: var(--bg-hover); color: var(--text-primary); }
-.armed-strip button[data-active="true"] {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-}
-
-/* Instruction label that rides beside the pointer while a tool is armed.
-   Fixed-size on purpose so the clamp() positioning stays predictable. */
-.cursor-label {
-  position: absolute;
-  z-index: 20;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 330px;
-  padding: 3px 8px;
-  font-size: 10px;
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-/* Right-click menu on a drawing, positioned inside the chart area. */
+/* Right-click menu on a drawing, positioned inside the chart area. Opaque on
+   purpose: it floats over live candles, and a blurred/translucent panel made the
+   chart look like a screenshot behind glass. */
 .ctx-menu {
   position: absolute;
   z-index: 50;
   display: flex;
   flex-direction: column;
-  min-width: 132px;
+  min-width: 150px;
   padding: 3px;
   font-size: 11px;
+  border-radius: 7px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
 }
 .ctx-title {
   padding: 3px 7px 4px;
@@ -298,14 +290,33 @@ body {
   color: var(--text-secondary);
 }
 .ctx-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+.ctx-danger { color: var(--danger); }
+.ctx-danger:hover { color: var(--danger); }
+.ctx-swatches {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px 5px;
+}
+.ctx-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: var(--swatch);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+.ctx-swatch[data-active="true"] {
+  box-shadow: 0 0 0 1.5px var(--bg-elevated), 0 0 0 3px var(--accent);
+}
 
-/* Floating cards over the chart (drawings list, selection actions). */
-.glass-card {
+/* Floating cards over the chart (drawings list, selection actions). Opaque like
+   .ctx-menu: anything translucent over live candles reads as a screenshot of a
+   chart rather than the chart itself. */
+.floating-panel {
   border-radius: 10px;
-  background: color-mix(in srgb, var(--bg-elevated) 82%, transparent);
+  background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
   box-shadow: var(--shadow);
-  backdrop-filter: blur(10px);
 }
 
 /* Resize handles */

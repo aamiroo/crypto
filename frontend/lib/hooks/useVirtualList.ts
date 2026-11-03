@@ -38,13 +38,12 @@ export function useVirtualList(count: number, rowHeight: number, overscan = 8): 
     return () => { if (frame.current !== null) cancelAnimationFrame(frame.current); };
   }, []);
 
-  useEffect(() => {
-    // Re-clamp when the list shrinks (filtering, tab change).
-    setRange((r) => ({
-      start: Math.min(r.start, Math.max(0, count - 1)),
-      end: Math.min(Math.max(r.end, 1), count),
-    }));
-  }, [count]);
+  // Clamped here rather than in an effect: the stored range is only ever a
+  // measurement of the scroll position, and the list can shrink (filtering, tab
+  // change) underneath it. Deriving keeps one window per paint instead of a
+  // stale range followed by a second render.
+  const start = Math.min(range.start, Math.max(0, count - 1));
+  const end = Math.min(Math.max(range.end, start + 1), count);
 
-  return { start: range.start, end: range.end, offsetY: range.start * rowHeight, onScroll };
+  return { start, end, offsetY: start * rowHeight, onScroll };
 }

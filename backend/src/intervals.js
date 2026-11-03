@@ -10,3 +10,34 @@ const MS = {
 export function intervalMs(iv) {
   return MS[iv] || 6e4;
 }
+
+/**
+ * First millisecond of the candle grid, as an offset from the unix epoch.
+ *
+ * Sub-daily and daily candles open on an epoch multiple, but weekly ones do not:
+ * the exchange opens a crypto week on Monday 00:00 UTC, and the epoch is a
+ * Thursday, so a real weekly bar carries `openTime % 604800000 === 345600000`.
+ * Anything that counts candle slots from the epoch is off by four days for this
+ * interval — enough to misreport the newest missing run by one bar and to call
+ * every genuine weekly candle misaligned.
+ *
+ * Measured from the venue (live frames and the persisted mirror agree), not
+ * assumed from a calendar.
+ */
+const ORIGIN = { "1w": 3456e5 };
+
+/** Slot origin for one interval; `0` means the candle grid is epoch-aligned. */
+export function intervalOrigin(iv) {
+  return ORIGIN[iv] || 0;
+}
+
+/** True only for an interval this app actually serves — never the 1m fallback. */
+export function isSupportedInterval(iv) {
+  return Object.prototype.hasOwnProperty.call(MS, iv);
+}
+
+/** Which slot of the grid a timestamp falls in, as its opening millisecond. */
+export function slotOf(time, iv) {
+  const ms = intervalMs(iv);
+  return Math.floor((time - intervalOrigin(iv)) / ms) * ms + intervalOrigin(iv);
+}

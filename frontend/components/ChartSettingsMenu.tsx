@@ -3,6 +3,7 @@
 import { useChartStore } from "@/lib/store/chartStore";
 import { Popover } from "@/components/ui/Popover";
 import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
+import { GearIcon } from "@/components/icons/ToolIcons";
 import type { ChartSettings } from "@/lib/types";
 
 export function ChartSettingsMenu() {
@@ -17,7 +18,7 @@ export function ChartSettingsMenu() {
   );
 
   return (
-    <Popover label="⚙" tooltip="Chart settings" align="right" width={220}>
+    <Popover label={<GearIcon size={14} />} tooltip="Chart settings" align="right" width={220}>
       {() => (
         <div className="space-y-0.5">
           <div className="px-1 pb-1 text-[11px] font-semibold" style={{ color: "var(--text-primary)" }}>Chart</div>

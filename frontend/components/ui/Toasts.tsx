@@ -1,7 +1,9 @@
 "use client";
 
+import type { ReactNode } from "react";
 import { useToastStore } from "@/lib/store/toastStore";
 import type { ToastKind } from "@/lib/types";
+import { CheckIcon, CloseIcon, InfoIcon, WarningIcon } from "@/components/icons/ToolIcons";
 
 const COLORS: Record<ToastKind, string> = {
   success: "var(--success)",
@@ -10,11 +12,11 @@ const COLORS: Record<ToastKind, string> = {
   info: "var(--info)",
 };
 
-const ICONS: Record<ToastKind, string> = {
-  success: "✓",
-  error: "✕",
-  warning: "!",
-  info: "i",
+const ICONS: Record<ToastKind, ReactNode> = {
+  success: <CheckIcon size={10} />,
+  error: <CloseIcon size={10} />,
+  warning: <WarningIcon size={10} />,
+  info: <InfoIcon size={10} />,
 };
 
 export function Toasts() {
@@ -36,7 +38,7 @@ export function Toasts() {
             {ICONS[t.kind]}
           </span>
           <span className="flex-1 leading-snug" style={{ color: "var(--text-secondary)" }}>{t.message}</span>
-          <button onClick={() => dismiss(t.id)} className="icon-btn h-4 w-4 text-[10px]">✕</button>
+          <button onClick={() => dismiss(t.id)} className="icon-btn h-4 w-4 flex-shrink-0" aria-label="Dismiss"><CloseIcon size={9} /></button>
         </div>
       ))}
     </div>

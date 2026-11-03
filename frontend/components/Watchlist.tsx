@@ -1,10 +1,11 @@
 "use client";
 import { memo, useMemo, useRef, useState, useEffect } from "react";
-import { useMarketStore } from "@/lib/store/marketStore";
+import { useMarketStore, topLiquid } from "@/lib/store/marketStore";
 import { useWatchlistStore } from "@/lib/store/watchlistStore";
 import { fmtPrice, fmtPct, fmtVolume } from "@/lib/utils/format";
 import { baseAsset } from "@/lib/utils/symbol";
 import { CoinIcon } from "@/components/CoinIcon";
+import { CaretIcon, StarIcon } from "@/components/icons/ToolIcons";
 import { Panel } from "@/components/ui/Panel";
 import { useVirtualList } from "@/lib/hooks/useVirtualList";
 
@@ -12,6 +13,9 @@ type Tab = "favorites" | "all";
 type SortKey = "sym" | "price" | "change" | "vol";
 
 const ROW_H = 24;
+/** Rows in the "favorites" tab before the user has favourited anything: the
+ *  market's most traded pairs, so an empty watchlist is still a useful one. */
+const DEFAULT_WATCH_SIZE = 30;
 
 export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
   const symbols = useMarketStore((s) => s.symbols);
@@ -32,9 +36,18 @@ export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
   // does not re-filter and re-sort on every 250 ms ticker flush.
   const sortTickers = sort === "sym" ? null : tickers;
 
+  /** The pairs worth watching, before the user has favourited anything. Ranked by
+   *  quote turnover rather than the exchange's catalogue order, and held stable
+   *  between batches (see `topLiquid`) so a live feed cannot shuffle rows out
+   *  from under the pointer. */
+  const topPairs = useMemo(
+    () => topLiquid(symbols, tickers, DEFAULT_WATCH_SIZE),
+    [symbols, tickers],
+  );
+
   const rows = useMemo(() => {
     const universe = tab === "favorites"
-      ? (favorites.length ? favorites : symbols.slice(0, 30))
+      ? (favorites.length ? favorites : topPairs)
       : symbols;
     const q = query.trim().toUpperCase();
     let list = q ? universe.filter((s) => s.includes(q)) : universe;
@@ -50,7 +63,7 @@ export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
       list = [...list].reverse();
     }
     return list;
-  }, [tab, favorites, symbols, query, sort, asc, sortTickers]);
+  }, [tab, favorites, symbols, query, sort, asc, sortTickers, topPairs]);
 
   const virt = useVirtualList(rows.length, ROW_H);
   const scroller = useRef<HTMLDivElement>(null);
@@ -63,7 +76,10 @@ export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
     else { setSort(k); setAsc(k !== "sym"); }
   };
 
-  const arrow = (k: SortKey) => (sort === k ? (asc ? "▲" : "▼") : "");
+  // One caret shape for both directions: the triangle glyphs (▲▼) were heavier
+  // than the 9px column labels and sat on a different baseline.
+  const arrow = (k: SortKey) =>
+    sort === k ? <CaretIcon size={9} className={`inline-block align-middle ${asc ? "" : "rotate-180"}`} /> : null;
   const slice = rows.slice(virt.start, virt.end);
 
   return (
@@ -72,7 +88,7 @@ export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
       onCollapse={onCollapse}
       right={
         <div className="flex items-center gap-0.5">
-          <button onClick={() => setTab("favorites")} className="seg-btn" data-active={tab === "favorites"}>★</button>
+          <button onClick={() => setTab("favorites")} className="seg-btn flex items-center" data-active={tab === "favorites"} aria-label="Favorites"><StarIcon size={12} /></button>
           <button onClick={() => setTab("all")} className="seg-btn" data-active={tab === "all"}>All</button>
         </div>
       }
@@ -86,7 +102,7 @@ export function Watchlist({ onCollapse }: { onCollapse?: () => void }) {
           className="mx-2 mb-1 h-6 flex-shrink-0 rounded px-2 text-[11px] outline-none"
           style={{ background: "var(--bg-surface)", color: "var(--text-primary)", border: "1px solid var(--border)" }}
         />
-        <div className="grid flex-shrink-0 grid-cols-[16px_1fr_64px_52px_50px] gap-x-1 border-b px-2 pb-0.5 text-[9px]" style={{ color: "var(--text-muted)", borderColor: "var(--border)" }}>
+        <div className="grid flex-shrink-0 grid-cols-[16px_minmax(0,1fr)_62px_46px_44px] gap-x-1 border-b px-2 pb-0.5 text-[9px]" style={{ color: "var(--text-muted)", borderColor: "var(--border)" }}>
           <span />
           <button onClick={() => sortBy("sym")} className="text-left uppercase tracking-wide">Symbol {arrow("sym")}</button>
           <button onClick={() => sortBy("price")} className="text-right uppercase tracking-wide">Price {arrow("price")}</button>
@@ -144,7 +160,7 @@ const WatchlistRow = memo(function WatchlistRow({
 
   return (
     <div
-      className="group grid grid-cols-[16px_1fr_64px_52px_50px] items-center gap-x-1 px-2"
+      className="group grid grid-cols-[16px_minmax(0,1fr)_62px_46px_44px] items-center gap-x-1 px-2"
       style={{
         height: ROW_H,
         background: selected ? "var(--bg-surface)" : "transparent",
@@ -155,10 +171,10 @@ const WatchlistRow = memo(function WatchlistRow({
         onClick={() => onToggleFavorite(symbol)}
         title={favorite ? "Remove from favorites" : "Add to favorites"}
         aria-label={favorite ? `Remove ${symbol} from favorites` : `Add ${symbol} to favorites`}
-        className="text-[10px] leading-none"
+        className="flex h-4 w-4 items-center justify-center"
         style={{ color: favorite ? "var(--accent)" : "var(--text-muted)" }}
       >
-        {favorite ? "★" : "☆"}
+        <StarIcon size={11} filled={favorite} />
       </button>
       <button onClick={() => onPick(symbol)} className="flex min-w-0 items-center gap-1 text-left">
         <CoinIcon symbol={symbol} size="xs" />

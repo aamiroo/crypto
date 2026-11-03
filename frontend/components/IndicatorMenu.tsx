@@ -1,7 +1,9 @@
 "use client";
 
 import { useChartStore } from "@/lib/store/chartStore";
+import { newIndicatorId } from "@/lib/utils/indicators";
 import { Popover } from "@/components/ui/Popover";
+import { CloseIcon, IndicatorsIcon } from "@/components/icons/ToolIcons";
 import type { IndicatorConfig } from "@/lib/types";
 
 const QUICK_ADD: { type: IndicatorConfig["type"]; label: string; period: number; color: string }[] = [
@@ -9,7 +11,9 @@ const QUICK_ADD: { type: IndicatorConfig["type"]; label: string; period: number;
   { type: "ema", label: "EMA", period: 50, color: "#8b5cf6" },
   { type: "rsi", label: "RSI", period: 14, color: "#38bdf8" },
   { type: "macd", label: "MACD", period: 12, color: "#2196f3" },
-  { type: "bb", label: "BB", period: 20, color: "#f59e0b" },
+  // Bollinger used the same amber as SMA, so two overlaid bands were impossible
+  // to tell apart in the legend and on the chart.
+  { type: "bb", label: "BB", period: 20, color: "#34d399" },
 ];
 
 const TYPE_LABEL: Record<IndicatorConfig["type"], string> = {
@@ -28,13 +32,12 @@ export function IndicatorMenu() {
   const visibleCount = indicators.filter((i) => i.visible).length;
 
   const add = (q: (typeof QUICK_ADD)[number]) => {
-    const id = `${q.type}${q.period}-${Date.now().toString(36)}`;
-    addIndicator({ id, type: q.type, period: q.period, visible: true, color: q.color });
+    addIndicator({ id: newIndicatorId(q.type, q.period), type: q.type, period: q.period, visible: true, color: q.color });
     if (!showIndicators) updateSettings({ showIndicators: true });
   };
 
   return (
-    <Popover label="ƒ" tooltip="Indicators" active={showIndicators && visibleCount > 0} align="left" width={280}>
+    <Popover label={<IndicatorsIcon size={14} />} tooltip="Indicators" active={showIndicators && visibleCount > 0} align="left" width={280}>
       {() => (
         <div className="space-y-2">
           <div className="flex items-center justify-between px-1">
@@ -94,7 +97,7 @@ export function IndicatorMenu() {
                     title="Period"
                   />
                 )}
-                <button onClick={() => removeIndicator(ind.id)} className="icon-btn h-5 w-5 text-[10px]" title="Remove">✕</button>
+                <button onClick={() => removeIndicator(ind.id)} className="icon-btn h-5 w-5" title="Remove" aria-label={`Remove ${TYPE_LABEL[ind.type]}`}><CloseIcon size={11} /></button>
               </div>
             ))}
           </div>
