@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
  *  instead of relying on the inference. */
 const nextConfig = {
   turbopack: { root: join(dirname(fileURLToPath(import.meta.url)), "..") },
+  allowedDevOrigins: ["192.168.100.69"],
 };
 
 export default nextConfig;

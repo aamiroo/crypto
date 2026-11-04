@@ -43,8 +43,15 @@ interface MarketState {
 }
 
 const MAX_TRADES = 100;
+const MAX_SEEN_TRADE_IDS = 2000;
 const TICKER_BATCH_MS = 250;
 const MESSAGE_TS_STEP_MS = 1000;
+
+/** Tracks trade IDs seen in this session so a replayed trade (reconnect,
+ *  REST catch-up, or a duplicate WS frame) cannot push the same fill twice.
+ *  Without this the recent-trades list fills with duplicates and React warns
+ *  about duplicate keys. */
+const seenTradeIds = new Set<string>();
 
 /** Stable reference for "no trades for this symbol yet": a selector that returned
  *  a fresh `[]` handed the component a new array identity on every unrelated
@@ -160,6 +167,25 @@ export const useMarketStore = create<MarketState>((set, get) => ({
       case "trade": {
         const data = env.data as TradeData;
         const trade = { ...data, ts: env.ts };
+        // Dedup by trade ID: a reconnect replays the last few fills, and without
+        // this the recent-trades list fills with duplicates that React then
+        // warns about as duplicate keys.
+        const id = trade.id;
+        if (id !== undefined && id !== null) {
+          if (seenTradeIds.has(String(id))) break;
+          seenTradeIds.add(String(id));
+          if (seenTradeIds.size > MAX_SEEN_TRADE_IDS) {
+            // Keep the set bounded: drop the oldest entries so a long session
+            // does not grow the set without limit.
+            const toDrop = seenTradeIds.size - MAX_SEEN_TRADE_IDS;
+            let dropped = 0;
+            for (const k of seenTradeIds) {
+              if (dropped >= toDrop) break;
+              seenTradeIds.delete(k);
+              dropped += 1;
+            }
+          }
+        }
         set((st) => {
           const list = [trade, ...(st.recentTrades[sym] ?? [])].slice(0, MAX_TRADES);
           return { recentTrades: { ...st.recentTrades, [sym]: list } };

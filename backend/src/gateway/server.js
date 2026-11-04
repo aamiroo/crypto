@@ -642,7 +642,6 @@ export function startKlineWindowRefresh({ refreshWindow, demand, intervalMs, log
 export function createGateway(instruments, venues, logger, collector, klines, crawler) {
   const hub = new Hub(logger);
   const server = http.createServer();
-  const bridged = new Set();
   const klinesStore = klines ?? createKlinesStore({ logger });
   const fetcher = createKlinesFetcher({ store: klinesStore, logger });
   const fetchKlines = fetcher.fetchKlines;
@@ -660,29 +659,61 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
   });
 
   /* ── bus → hub bridge ────────────────────────────────────────── */
+  // Every subject the bridge subscribes to is tracked so that an instrument
+  // refresh can tear down the ones for delisted pairs. Without this the bus
+  // accumulates listeners for symbols that no longer exist, and each one is
+  // still invoked on every broadcast — the progressive leak behind the
+  // terminal's slowdown during extended sessions.
+  const bridged = new Set();
+  const bridgeListeners = new Map(); // symbol -> [{ subject, listener }]
+
   function bridge(symbol) {
     if (bridged.has(symbol)) return;
     bridged.add(symbol);
+    const entries = [];
     for (const venue of venues) {
-      bus.on(subject(venue, symbol, "orderbook.snapshot"), (e) => hub.broadcastSnapshot("orderbook", symbol, e.ts, e));
-      bus.on(subject(venue, symbol, "orderbook.delta"),   (e) => hub.broadcastDelta("orderbook", symbol, e.ts, e));
-      bus.on(subject(venue, symbol, "trades"),            (e) => hub.broadcastEvent("trade", "trades", symbol, e.ts, e));
-      bus.on(subject(venue, symbol, "ticker"),            (e) => hub.broadcastEvent("ticker", "ticker", symbol, e.ts, e));
+      const subs = [
+        [subject(venue, symbol, "orderbook.snapshot"), (e) => hub.broadcastSnapshot("orderbook", symbol, e.ts, e)],
+        [subject(venue, symbol, "orderbook.delta"),   (e) => hub.broadcastDelta("orderbook", symbol, e.ts, e)],
+        [subject(venue, symbol, "trades"),            (e) => hub.broadcastEvent("trade", "trades", symbol, e.ts, e)],
+        [subject(venue, symbol, "ticker"),            (e) => hub.broadcastEvent("ticker", "ticker", symbol, e.ts, e)],
+      ];
       for (const iv of INTERVALS) {
-        // The stream is also the mirror's live feed: candles that arrive here are
-        // the only history the gateway has while the venue's REST is unreachable.
-        bus.on(subject(venue, symbol, `kline.${iv}`), (e) => {
+        subs.push([subject(venue, symbol, `kline.${iv}`), (e) => {
           hub.broadcastKline(symbol, e.ts, e);
-          klinesStore.append(symbol, iv, e);
-        });
+          // append is async: the first tick for a cold window reads the mirror
+          // file off the event loop instead of stalling this callback.
+          void klinesStore.append(symbol, iv, e);
+        }]);
       }
+      for (const [subj, fn] of subs) {
+        bus.on(subj, fn);
+        entries.push({ subject: subj, listener: fn });
+      }
+    }
+    bridgeListeners.set(symbol, entries);
+  }
+
+  function unbridge(symbol) {
+    if (!bridged.has(symbol)) return;
+    bridged.delete(symbol);
+    const entries = bridgeListeners.get(symbol);
+    if (entries) {
+      for (const { subject: subj, listener: fn } of entries) {
+        bus.removeListener(subj, fn);
+      }
+      bridgeListeners.delete(symbol);
     }
   }
 
-  /** Re-run after instrument discovery: `bridge` is idempotent, so only the
-   *  symbols that appeared get new bus listeners. */
+  /** Re-run after instrument discovery: adds listeners for new symbols and
+   *  removes ones for pairs that were delisted since the last pass. */
   function syncBridge() {
-    for (const sym of instruments.symbols) bridge(sym);
+    const current = new Set(instruments.symbols);
+    for (const sym of [...bridged]) {
+      if (!current.has(sym)) unbridge(sym);
+    }
+    for (const sym of current) bridge(sym);
   }
   syncBridge();
   instruments.onChange = syncBridge;

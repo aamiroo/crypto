@@ -723,6 +723,17 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
     return w;
   }
 
+  /** Async variant: the disk read goes off the event loop, so a stream tick
+   *  never stalls Node while the OS page cache is faulting in a cold window.
+   *  The in-memory record is always populated before the caller proceeds; the
+   *  async read only feeds the *first* append for a (symbol, interval) pair. */
+  async function openWindowAsync(symbol, interval) {
+    const w = registerWindow(symbol, interval);
+    if (!w.loaded) await readAsyncOnce(w);
+    touch(w);
+    return w;
+  }
+
   /** Widen the range the venue answered for, and the counter that goes with it. */
   function noteVenue(w, tuples) {
     const span = pageSpan(tuples);
@@ -959,12 +970,16 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
      *  networks), while the websocket keeps delivering candles. A stream tick is
      *  a live candle, not fetched history, so it never extends `venueBars` — the
      *  difference between "the chart is current" and "we have history" has to
-     *  survive the tail arriving. */
-    append(symbol, interval, k) {
+     *  survive the tail arriving.
+     *
+     *  Async: the first append for a cold window reads the mirror file off the
+     *  event loop instead of stalling the bus callback that feeds this method.
+     */
+    async append(symbol, interval, k) {
       const tuple = toValidTuple(k, interval);
       if (!tuple) return false;
       const openTime = tuple[0];
-      const w = openWindow(symbol, interval);
+      const w = await openWindowAsync(symbol, interval);
       if (!w.loaded) return false;
       const candles = w.candles ?? [];
       const last = candles[candles.length - 1];

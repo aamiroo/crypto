@@ -203,8 +203,35 @@ export type CandlePrecedence = (stored: KlineData, incoming: KlineData) => boole
 /**
  * Insert one kline keeping the array sorted. Returns the SAME reference when
  * nothing changes so zustand subscribers don't re-render needlessly.
+ *
+ *  The common live-tick cases (append a new candle, update the forming one)
+ *  are handled before the binary search: they are O(n) for the immutable copy
+ *  but avoid the second O(n) pass `splice` used to be correct in the slow
+ *  path, and they skip the search entirely.
  */
 function mergeOne(base: KlineData[], k: KlineData, protect?: CandlePrecedence): KlineData[] {
+  const last = base[base.length - 1];
+
+  // Fast path: appending a new candle to the end — the common live tick.
+  if (!last || k.openTime > last.openTime) {
+    if (base.length >= MAX_KLINES) {
+      const next = base.slice(1);
+      next.push(k);
+      return next;
+    }
+    return [...base, k];
+  }
+
+  // Fast path: updating the forming (last) candle in place.
+  if (k.openTime === last.openTime) {
+    if (sameValues(last, k)) return base;
+    if (protect?.(last, k)) return base;
+    const next = base.slice();
+    next[next.length - 1] = k;
+    return next;
+  }
+
+  // Slow path: out-of-order insertion (rare — replay, backfill, correction).
   let lo = 0;
   let hi = base.length;
   while (lo < hi) {
