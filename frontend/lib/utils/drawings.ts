@@ -31,9 +31,17 @@ export const TOOLS: ToolDef[] = [
   { id: "horizontal", label: "Horizontal line", key: "h", points: 1, group: "line", hint: "Click once at a price" },
   { id: "vertical", label: "Vertical line", key: "b", points: 1, group: "line", hint: "Click once at a time" },
   { id: "trendline", label: "Trend line", key: "t", points: 2, group: "line", hint: "Click the start, then the end" },
+  { id: "extendedLine", label: "Extended line", key: "e", points: 2, group: "line", hint: "Click start, then end — extends both ways" },
   { id: "ray", label: "Ray", key: "j", points: 2, group: "line", hint: "Click the origin, then a direction" },
+  { id: "parallelChannel", label: "Parallel line", key: "p", points: 3, group: "line", hint: "Click line 1 start, line 1 end, then a point on line 2" },
   { id: "fibonacci", label: "Fib Retracement", key: "g", points: 2, group: "analysis", hint: "Click the swing low, then the swing high" },
+  { id: "fibExtension", label: "Fib Extension", key: "x", points: 3, group: "analysis", hint: "Click swing low, swing high, then extension point" },
   { id: "measure", label: "Measure", key: "m", points: 2, group: "analysis", hint: "Click the start, then the end" },
+  { id: "rectangle", label: "Rectangle", key: "r", points: 2, group: "analysis", hint: "Click one corner, then the opposite corner" },
+  { id: "circle", label: "Circle", key: "c", points: 2, group: "analysis", hint: "Click centre, then a point on the circumference" },
+  { id: "text", label: "Text", key: "n", points: 1, group: "analysis", hint: "Click to place a text label" },
+  { id: "arrow", label: "Arrow", key: "a", points: 2, group: "analysis", hint: "Click start, then tip of the arrow" },
+  { id: "priceLabel", label: "Price label", key: "d", points: 1, group: "analysis", hint: "Click once at a price" },
   { id: "longPosition", label: "Long position", key: "l", points: 3, group: "risk", hint: "Click entry, then take-profit, then stop-loss" },
   { id: "shortPosition", label: "Short position", key: "k", points: 3, group: "risk", hint: "Click entry, then take-profit, then stop-loss" },
 ];
@@ -79,8 +87,16 @@ export const TYPE_LABEL: Record<DrawingType, string> = {
   vertical: "Vertical line",
   trendline: "Trend line",
   ray: "Ray",
+  extendedLine: "Extended line",
+  parallelChannel: "Parallel line",
   fibonacci: "Fib retracement",
+  fibExtension: "Fib extension",
   measure: "Measure",
+  rectangle: "Rectangle",
+  circle: "Circle",
+  text: "Text",
+  arrow: "Arrow",
+  priceLabel: "Price label",
   longPosition: "Long position",
   shortPosition: "Short position",
 };
@@ -112,8 +128,16 @@ const TOOL_TYPE: Partial<Record<ChartTool, DrawingType>> = {
   vertical: "vertical",
   trendline: "trendline",
   ray: "ray",
+  extendedLine: "extendedLine",
+  parallelChannel: "parallelChannel",
   fibonacci: "fibonacci",
+  fibExtension: "fibExtension",
   measure: "measure",
+  rectangle: "rectangle",
+  circle: "circle",
+  text: "text",
+  arrow: "arrow",
+  priceLabel: "priceLabel",
   longPosition: "longPosition",
   shortPosition: "shortPosition",
 };
@@ -131,8 +155,16 @@ export const COLORS: Record<DrawingType, string> = {
   // made trendlines look broken there. This grey has contrast in both.
   trendline: "#8f9bb3",
   ray: "#38bdf8",
+  extendedLine: "#8f9bb3",
+  parallelChannel: "#38bdf8",
   fibonacci: "#f59e0b",
+  fibExtension: "#f59e0b",
   measure: "#38bdf8",
+  rectangle: "#8b5cf6",
+  circle: "#8b5cf6",
+  text: "#f59e0b",
+  arrow: "#38bdf8",
+  priceLabel: "#f59e0b",
   longPosition: "#10b981",
   shortPosition: "#f43f5e",
 };
@@ -159,7 +191,7 @@ function completePoints(type: DrawingType, points: DrawingPoint[]): DrawingPoint
  *  and runs points through completePoints so a 2-click position still gets its
  *  derived stop-loss anchor. */
 export function makeDrawing(symbol: string, type: DrawingType, points: DrawingPoint[]): Drawing {
-  return {
+  const d: Drawing = {
     id: newDrawingId(),
     type,
     symbol,
@@ -168,6 +200,10 @@ export function makeDrawing(symbol: string, type: DrawingType, points: DrawingPo
     visible: true,
     locked: false,
   };
+  // Text and arrow carry a label — default to empty so the shape is still
+  // editable after creation.
+  if (type === "text" || type === "arrow" || type === "priceLabel") d.text = "";
+  return d;
 }
 
 /** Tool-aware wrapper around makeDrawing: returns null for crosshair so the

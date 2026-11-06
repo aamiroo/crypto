@@ -41,6 +41,7 @@ interface ChartState {
   addDrawing: (symbol: string, d: Drawing) => void;
   updateDrawingPoints: (symbol: string, id: string, points: DrawingPoint[]) => void;
   updateDrawing: (symbol: string, id: string, patch: Partial<Drawing>) => void;
+  duplicateDrawing: (symbol: string, id: string) => void;
   removeDrawing: (symbol: string, id: string) => void;
   clearDrawings: (symbol: string) => void;
   undoDrawings: () => void;
@@ -95,8 +96,6 @@ function isDrawingPoint(value: unknown): value is DrawingPoint {
   return (typeof time === "number" && Number.isFinite(time)) && (typeof price === "number" && Number.isFinite(price));
 }
 
-/** Renderers branch on `points[1]`/`points[2]`, so a shape only has to carry
- *  finite anchors; a shorter list just paints less. */
 function asDrawing(value: unknown, symbol: string): Drawing | null {
   if (!isRecord(value) || typeof value.id !== "string" || !value.id) return null;
   const type = value.type;
@@ -113,6 +112,12 @@ function asDrawing(value: unknown, symbol: string): Drawing | null {
     color: typeof value.color === "string" && value.color ? value.color : COLORS[type as Drawing["type"]],
     ...(typeof value.locked === "boolean" ? { locked: value.locked } : {}),
     ...(typeof value.visible === "boolean" ? { visible: value.visible } : {}),
+    ...(typeof value.text === "string" ? { text: value.text } : {}),
+    ...(typeof value.fontSize === "number" && Number.isFinite(value.fontSize) ? { fontSize: value.fontSize } : {}),
+    ...(typeof value.lineWidth === "number" && Number.isFinite(value.lineWidth) ? { lineWidth: value.lineWidth } : {}),
+    ...(Array.isArray(value.dash) ? { dash: value.dash.filter((n) => typeof n === "number") } : {}),
+    ...(typeof value.fillOpacity === "number" && Number.isFinite(value.fillOpacity) ? { fillOpacity: value.fillOpacity } : {}),
+    ...(typeof value.name === "string" ? { name: value.name } : {}),
   };
 }
 
@@ -276,6 +281,23 @@ export const useChartStore = create<ChartState>((set, get) => ({
       const next = cur.map((d) => (d.id === id ? { ...d, ...patch } : d));
       persistDrawings({ ...s.drawingsBySymbol, [symbol]: next });
       return { drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: next } };
+    }),
+
+  /** Duplicate a drawing with a new id, keeping its geometry and colour. */
+  duplicateDrawing: (symbol, id) =>
+    set((s) => {
+      const cur = s.drawingsBySymbol[symbol] ?? [];
+      const src = cur.find((d) => d.id === id);
+      if (!src) return {};
+      const copy = { ...src, id: `d-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}` };
+      const next = [...cur, copy].slice(-MAX_PER_SYMBOL);
+      persistDrawings({ ...s.drawingsBySymbol, [symbol]: next });
+      return {
+        drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: next },
+        past: [...s.past, { symbol, list: cur }].slice(-MAX_HISTORY),
+        future: [],
+        selectedId: copy.id,
+      };
     }),
 
   removeDrawing: (symbol, id) =>

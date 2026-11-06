@@ -5,7 +5,7 @@ import type { IChartApi, MouseEventParams } from "lightweight-charts";
 import { useChartStore, selectDrawings } from "@/lib/store/chartStore";
 import { PALETTE, TYPE_LABEL, drawingForTool, isPlacementTool, pointsRequired } from "@/lib/utils/drawings";
 import { parseHit, type DrawingsPrimitive } from "@/lib/chart/drawingsPrimitive";
-import { EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
+import { EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon, DuplicateIcon } from "@/components/icons/ToolIcons";
 import type { ChartTool, Drawing, DrawingPoint } from "@/lib/types";
 
 interface Props {
@@ -30,10 +30,8 @@ type Gesture =
   | { kind: "body"; id: string; start: DrawingPoint[]; anchor: DrawingPoint }
   | { kind: "point"; id: string; index: number };
 
-/** Presses closer than this are one click, not a rubber-band drag. */
-const DRAG_SLOP = 4;
-/** Anchors closer than this build a shape with nothing to see or grab. */
-const MIN_ANCHOR_GAP = 4;
+const DRAG_SLOP = 3;
+const MIN_ANCHOR_GAP = 2;
 
 const MENU_W = 150;
 const MENU_H = 168;
@@ -190,14 +188,42 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
     };
 
     const onCrosshairMove = (p: MouseEventParams) => {
-      // `point` is relative to the pane the pointer is in, so a move over an
-      // oscillator pane is not a move over the drawings.
       const inPane = p.point != null && (p.paneIndex ?? 0) === prim.paneIndexOf();
-      const pt = inPane && p.point ? prim.unproject(p.point.x, p.point.y) : null;
+      let pt: DrawingPoint | null = null;
+      if (inPane && p.point) {
+        pt = prim.unproject(p.point.x, p.point.y);
+      }
+      if (!pt && p.point && inPane) {
+        // Allow drawing outside candle range - try to compute anyway
+        const chart = chartRef.current;
+        if (chart) {
+          try {
+            const ts = chart.timeScale();
+            const time = ts.coordinateToTime(p.point.x);
+            const series = (chart as any)._private__serieses?.[0] || (chart as any).serieses?.()?.[0];
+            if (typeof time === 'number' && series) {
+              const price = series.coordinateToPrice ? series.coordinateToPrice(p.point.y) : null;
+              if (price != null) pt = { time, price: Number(price) };
+            }
+          } catch {}
+        }
+      }
       aim = pt && p.point ? { x: p.point.x, y: p.point.y, pt } : null;
       if (pt) lastPt = pt;
 
-      hit = aim && p.hoveredInfo?.sourceKind === "series-primitive" ? parseHit(p.hoveredInfo.objectId) : null;
+      const rawHit = aim && p.hoveredInfo?.sourceKind === "series-primitive" ? parseHit(p.hoveredInfo.objectId) : null;
+      if (rawHit) {
+        const st = useChartStore.getState();
+        const drawings = selectDrawings(st, symbol);
+        const d = drawings.find((x) => x.id === rawHit.id);
+        if (d?.visible === false) {
+          hit = null;
+        } else {
+          hit = rawHit;
+        }
+      } else {
+        hit = null;
+      }
 
       if (gesture) {
         if (pt) moveShape(gesture, pt);
@@ -212,9 +238,6 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
         dirty = true;
       }
 
-      // The preview is built with the same factory as the finished shape, so it
-      // can never disagree with the result: fib levels, position bands and the
-      // measure readout all show up while the user is still aiming.
       const wantsGhost = st.settings.showDrawings && isPlacementTool(st.activeTool) && !spaceHeld;
       if (wantsGhost) {
         const pending = pendingRef.current;
@@ -238,8 +261,6 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
       if (isPlacementTool(st.activeTool)) {
         const pt = aim?.pt;
         if (!pt) return;
-        // Multi-point tools anchor on press so the preview follows the drag and
-        // the release closes the shape.
         const anchored = pointsRequired(st.activeTool) >= 2 && pendingRef.current.length === 0;
         if (anchored) pendingRef.current = [pt];
         gesture = { kind: "place", tool: st.activeTool, press: pt, x: e.clientX, y: e.clientY, anchored };
@@ -250,13 +271,13 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
 
       const h = hit;
       if (!h) {
-        if (aim) plainPress = { x: e.clientX, y: e.clientY };
+        if (aim && st.activeTool === "crosshair") {
+          plainPress = { x: e.clientX, y: e.clientY };
+        }
         return;
       }
       const d = selectDrawings(st, symbol).find((x) => x.id === h.id);
-      if (!d) return;
-      // A locked drawing still has to be selectable, or the lock could never be
-      // turned off again — it just refuses to move.
+      if (!d || d.visible === false) return;
       st.selectDrawing(d.id);
       if (d.locked) return;
       const pt = aim?.pt;
@@ -281,21 +302,18 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
       blockPan(false);
 
       if (g?.kind === "place") {
-        // Rubber-band release takes the release point; a click takes the press
-        // point, which is the same one the anchor already holds and is rejected
-        // as degenerate — so the second click of a click-click gesture is free.
         const moved = Math.abs(e.clientX - g.x) > DRAG_SLOP || Math.abs(e.clientY - g.y) > DRAG_SLOP;
         addPoint(moved ? (aim?.pt ?? lastPt ?? g.press) : g.press, g.tool);
         return;
       }
       if (g) return;
       if (!press) return;
-      // A press-and-release on empty chart drops the selection, so the menu and
-      // the handles never refer to a shape the user stopped looking at. A drag is
-      // a pan and keeps it.
       if (Math.abs(e.clientX - press.x) > DRAG_SLOP || Math.abs(e.clientY - press.y) > DRAG_SLOP) return;
       const st = useChartStore.getState();
-      if (st.activeTool === "crosshair" && st.selectedId) st.selectDrawing(null);
+      if (st.activeTool === "crosshair" && st.selectedId) {
+        const d = selectDrawings(st, symbol).find((x) => x.id === st.selectedId);
+        if (!hit) st.selectDrawing(null);
+      }
     };
 
     const endGesture = () => {
@@ -340,13 +358,25 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
      *  press would always belong to the shape, and a wide annotation would be
      *  impossible to place. */
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.code !== "Space" || isField(e.target)) return;
-      if (!isPlacementTool(useChartStore.getState().activeTool)) return;
-      e.preventDefault();
-      spaceHeld = true;
-      if (ghostRef.current) {
-        ghostRef.current = null;
-        prim.invalidate();
+      if (isField(e.target)) return;
+      if (e.code === "Space") {
+        if (!isPlacementTool(useChartStore.getState().activeTool)) return;
+        e.preventDefault();
+        spaceHeld = true;
+        if (ghostRef.current) {
+          ghostRef.current = null;
+          prim.invalidate();
+        }
+        return;
+      }
+      if (e.key === "Enter") {
+        const st = useChartStore.getState();
+        if (isPlacementTool(st.activeTool) && pendingRef.current.length > 0) {
+          e.preventDefault();
+          const last = pendingRef.current[pendingRef.current.length - 1]!;
+          addPoint(last, st.activeTool);
+        }
+        return;
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -439,6 +469,10 @@ function ContextMenu({ id, symbol, at, onClose }: { id: string; symbol: string; 
       <button className="ctx-item" onClick={run(() => st.updateDrawing(symbol, d.id, { visible: hidden }))}>
         {hidden ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
         {hidden ? "Show" : "Hide"}
+      </button>
+      <button className="ctx-item" onClick={run(() => st.duplicateDrawing(symbol, d.id))}>
+        <DuplicateIcon size={13} />
+        Duplicate
       </button>
       <button className="ctx-item ctx-danger" onClick={run(() => st.removeDrawing(symbol, d.id))}>
         <TrashIcon size={13} />

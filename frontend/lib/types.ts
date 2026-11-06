@@ -98,7 +98,12 @@ export interface IndicatorConfig {
 
 export type DrawingType =
   | "horizontal" | "vertical" | "trendline" | "ray"
-  | "fibonacci" | "measure" | "longPosition" | "shortPosition";
+  | "extendedLine" | "parallelChannel"
+  | "fibonacci" | "fibExtension"
+  | "measure"
+  | "rectangle" | "circle"
+  | "text" | "arrow" | "priceLabel"
+  | "longPosition" | "shortPosition";
 
 export interface DrawingPoint {
   /** Bar open time in ms. */
@@ -115,6 +120,18 @@ export interface Drawing {
   color: string;
   locked?: boolean;
   visible?: boolean;
+  /** Text content for text annotations and arrow labels. */
+  text?: string;
+  /** Font size in px for text annotations. */
+  fontSize?: number;
+  /** Line width override (1-10). */
+  lineWidth?: number;
+  /** Dash pattern in pixels. */
+  dash?: number[];
+  /** Fill opacity 0-1 for filled shapes. */
+  fillOpacity?: number;
+  /** Object name for tree display. */
+  name?: string;
 }
 
 export interface SymbolPrecision {
@@ -165,5 +182,9 @@ export interface ChartSettings {
 
 export type ChartTool =
   | "crosshair" | "horizontal" | "vertical" | "trendline" | "ray"
-  | "fibonacci" | "measure" | "longPosition" | "shortPosition";
+  | "extendedLine" | "parallelChannel"
+  | "fibonacci" | "fibExtension"
+  | "measure" | "rectangle" | "circle"
+  | "text" | "arrow" | "priceLabel"
+  | "longPosition" | "shortPosition";
 

@@ -8,9 +8,9 @@ import { ChartSettingsMenu } from "@/components/ChartSettingsMenu";
 import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
 import { TOOL_GROUPS, toolsInGroup } from "@/lib/utils/drawings";
 import {
-  CursorIcon, CaretIcon, EyeIcon, EyeOffIcon, ExpandIcon, CollapseIcon, FibonacciIcon, HorizontalIcon, LayersIcon,
-  LongPositionIcon, MeasureIcon, RayIcon, RedoIcon, ShortPositionIcon,
-  TrashIcon, TrendlineIcon, UndoIcon, VerticalIcon,
+  ArrowIcon, CaretIcon, CircleIcon, CursorIcon, DuplicateIcon, EyeIcon, EyeOffIcon, ExpandIcon, CollapseIcon,
+  ExtendedLineIcon, FibonacciIcon, FibExtensionIcon, HorizontalIcon, LayersIcon, LongPositionIcon, MeasureIcon, ParallelChannelIcon,
+  PriceLabelIcon, RayIcon, RectangleIcon, RedoIcon, ShortPositionIcon, TextIcon, TrashIcon, TrendlineIcon, UndoIcon, VerticalIcon,
 } from "@/components/icons/ToolIcons";
 import type { ToolDef } from "@/lib/utils/drawings";
 import type { ChartTool } from "@/lib/types";
@@ -29,9 +29,17 @@ const TOOL_ICON: Record<ChartTool, (p: { size?: number }) => ReactElement> = {
   horizontal: HorizontalIcon,
   vertical: VerticalIcon,
   trendline: TrendlineIcon,
+  extendedLine: ExtendedLineIcon,
   ray: RayIcon,
+  parallelChannel: ParallelChannelIcon,
   fibonacci: FibonacciIcon,
+  fibExtension: FibExtensionIcon,
   measure: MeasureIcon,
+  rectangle: RectangleIcon,
+  circle: CircleIcon,
+  text: TextIcon,
+  arrow: ArrowIcon,
+  priceLabel: PriceLabelIcon,
   longPosition: LongPositionIcon,
   shortPosition: ShortPositionIcon,
 };

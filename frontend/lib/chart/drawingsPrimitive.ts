@@ -91,6 +91,7 @@ export interface ShapeLine {
   alpha?: number;
 }
 export interface ShapeBand { x: number; y: number; w: number; h: number; color: ShapeColor; alpha: number }
+export interface ShapeArc { cx: number; cy: number; r: number; startAngle: number; endAngle: number; color: ShapeColor; width: number; alpha?: number }
 export interface ShapeTag { x: number; y: number; text: string; color: ShapeColor; align: "left" | "center" }
 export interface ShapeDot { x: number; y: number; r: number; fill: string; stroke: string }
 
@@ -101,6 +102,7 @@ export interface Shape {
   type: DrawingType;
   lines: ShapeLine[];
   bands: ShapeBand[];
+  arcs: ShapeArc[];
   tags: ShapeTag[];
   dots: ShapeDot[];
   /** Grab areas, used by `hitTest`: segments, boxes and points. */
@@ -140,6 +142,18 @@ export function distToSegment(px: number, py: number, x1: number, y1: number, x2
   return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
 }
 
+/** Distance from a point to a circle outline, in CSS pixels. */
+export function distToCircle(px: number, py: number, cx: number, cy: number, r: number): number {
+  return Math.abs(Math.hypot(px - cx, py - cy) - r);
+}
+
+/** Distance from a point to a rectangle edge, in CSS pixels. */
+export function distToRect(px: number, py: number, x: number, y: number, w: number, h: number): number {
+  const dx = Math.max(x - px, 0, px - (x + w));
+  const dy = Math.max(y - py, 0, py - (y + h));
+  return Math.hypot(dx, dy);
+}
+
 /**
  * Turns one drawing into pixel geometry, or null when it cannot be placed (off
  * scale, or missing the anchors its type needs). That null is also what makes a
@@ -149,14 +163,21 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
   const [p1, p2, p3] = d.points;
   if (!p1) return null;
   const color = style.color;
-  const width = style.selected ? 2.25 : style.hovered ? 1.9 : 1.4;
-  const alpha = style.ghost ? 0.55 : 1;
-  const out: Shape = { id: d.id, type: d.type, lines: [], bands: [], tags: [], dots: [], hit: { lines: [], bands: [], points: [] } };
+  const width = (d.lineWidth ?? (style.selected ? 2.6 : style.hovered ? 2.0 : 1.6));
+  const alpha = style.ghost ? 0.45 : 1;
+  const dash = d.dash;
+  const out: Shape = { id: d.id, type: d.type, lines: [], bands: [], arcs: [], tags: [], dots: [], hit: { lines: [], bands: [], points: [] } };
 
   const line = (x1: number, y1: number, x2: number, y2: number, opts?: { color?: ShapeColor; width?: number; dash?: number[] }) => {
-    const l: ShapeLine = { x1, y1, x2, y2, color: opts?.color ?? color, width: opts?.width ?? width, dash: opts?.dash, alpha };
+    const l: ShapeLine = { x1, y1, x2, y2, color: opts?.color ?? color, width: opts?.width ?? width, dash: opts?.dash ?? dash, alpha };
     out.lines.push(l);
     out.hit.lines.push([x1, y1, x2, y2]);
+  };
+
+  const arc = (cx: number, cy: number, r: number, startAngle: number, endAngle: number, opts?: { color?: ShapeColor; width?: number }) => {
+    const a: ShapeArc = { cx, cy, r, startAngle, endAngle, color: opts?.color ?? color, width: opts?.width ?? width, alpha };
+    out.arcs.push(a);
+    out.hit.lines.push([cx + r * Math.cos(startAngle), cy + r * Math.sin(startAngle), cx + r * Math.cos(endAngle), cy + r * Math.sin(endAngle)]);
   };
 
   if (d.type === "horizontal") {
@@ -169,7 +190,7 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
   if (d.type === "vertical") {
     const x = proj.xOf(p1.time);
     if (x == null) return null;
-    line(x, 0, x, proj.plotH, { dash: [4, 3] });
+    line(x, 0, x, proj.plotH, { dash: [4, 2] });
     return out;
   }
 
@@ -186,7 +207,7 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
         ey = y1 + dy * ((edge - x1) / (dx || 1e-9));
       }
     }
-    line(x1, y1, ex, ey, { dash: d.type === "measure" ? [5, 4] : undefined });
+    line(x1, y1, ex, ey, { dash: d.type === "measure" ? [3, 3] : undefined });
     if (d.type === "measure") {
       const diff = p2.price - p1.price;
       const pct = p1.price !== 0 ? (diff / p1.price) * 100 : 0;
@@ -194,7 +215,7 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
       const span = minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 60)}h`;
       out.tags.push({
         x: (x1 + x2) / 2,
-        y: (y1 + y2) / 2 - 10,
+        y: (y1 + y2) / 2 - 12,
         text: `${diff >= 0 ? "+" : ""}${trimDiff(diff)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%) · ${span}`,
         color: diff >= 0 ? "up" : "down",
         align: "center",
@@ -207,7 +228,6 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
     const x1 = proj.xOf(p1.time), x2 = proj.xOf(p2.time);
     if (x1 == null || x2 == null) return null;
     const left = Math.min(x1, x2);
-    // A shape squashed onto one point would be invisible and impossible to grab.
     const right = Math.max(x1, x2, left + 8);
     const rows: { lvl: number; price: number; y: number }[] = [];
     for (const lvl of FIB_LEVELS) {
@@ -220,13 +240,151 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
     const top = Math.min(...ys);
     const bottom = Math.max(...ys);
     const boxH = Math.max(bottom - top, 8);
-    out.bands.push({ x: left, y: top, w: right - left, h: boxH, color, alpha: style.hovered || style.selected ? 0.12 : 0.07 });
+    out.bands.push({ x: left, y: top, w: right - left, h: boxH, color, alpha: style.hovered || style.selected ? 0.14 : 0.09 });
     out.hit.bands.push([left, top, right - left, boxH]);
     for (const r of rows) {
-      out.lines.push({ x1: left, y1: r.y, x2: right, y2: r.y, color, width: r.lvl === 0 || r.lvl === 1 ? width : 1, alpha });
+      out.lines.push({ x1: left, y1: r.y, x2: right, y2: r.y, color, width: r.lvl === 0 || r.lvl === 1 ? width + 0.3 : width * 0.9, alpha });
       out.hit.lines.push([left, r.y, right, r.y]);
-      out.tags.push({ x: right + 4, y: r.y + 3, text: `${r.lvl.toFixed(3)}  ${fmtPrice(r.price)}`, color, align: "left" });
+      out.tags.push({ x: right + 6, y: r.y + 3, text: `${r.lvl.toFixed(3)}  ${fmtPrice(r.price)}`, color, align: "left" });
     }
+    return out;
+  }
+
+  if (d.type === "fibExtension" && p2 && p3) {
+    const x1 = proj.xOf(p1.time), x2 = proj.xOf(p2.time), x3 = proj.xOf(p3.time);
+    if (x1 == null || x2 == null || x3 == null) return null;
+    const left = Math.min(x1, x2, x3);
+    const right = Math.max(x1, x2, x3, left + 8);
+    const rows: { lvl: number; price: number; y: number }[] = [];
+    const EXT_LEVELS = [1.618, 2.618, 4.236];
+    for (const lvl of [...FIB_LEVELS, ...EXT_LEVELS]) {
+      const price = p1.price + (p2.price - p1.price) * lvl;
+      const y = proj.yOf(price);
+      if (y != null) rows.push({ lvl, price, y });
+    }
+    if (rows.length === 0) return null;
+    const ys = rows.map((r) => r.y);
+    const top = Math.min(...ys);
+    const bottom = Math.max(...ys);
+    const boxH = Math.max(bottom - top, 8);
+    out.bands.push({ x: left, y: top, w: right - left, h: boxH, color, alpha: style.hovered || style.selected ? 0.14 : 0.09 });
+    out.hit.bands.push([left, top, right - left, boxH]);
+    for (const r of rows) {
+      const isExt = EXT_LEVELS.includes(r.lvl);
+      out.lines.push({ x1: left, y1: r.y, x2: right, y2: r.y, color, width: r.lvl === 0 || r.lvl === 1 || isExt ? width + 0.3 : width * 0.9, dash: isExt ? [2, 2] : undefined, alpha });
+      out.hit.lines.push([left, r.y, right, r.y]);
+      out.tags.push({ x: right + 6, y: r.y + 3, text: `${r.lvl.toFixed(3)}  ${fmtPrice(r.price)}`, color, align: "left" });
+    }
+    return out;
+  }
+
+  if (d.type === "extendedLine" && p2) {
+    const x1 = proj.xOf(p1.time), y1 = proj.yOf(p1.price);
+    const x2 = proj.xOf(p2.time), y2 = proj.yOf(p2.price);
+    if (x1 == null || y1 == null || x2 == null || y2 == null) return null;
+    const dx = x2 - x1;
+    if (dx === 0) {
+      line(x1, 0, x1, proj.plotH);
+      out.hit.bands.push([x1 - 4, 0, 8, proj.plotH]);
+      return out;
+    }
+    const left = 0, right = proj.plotW;
+    const ey1 = y1 + (y2 - y1) * ((left - x1) / dx);
+    const ey2 = y1 + (y2 - y1) * ((right - x1) / dx);
+    line(left, ey1, right, ey2, { dash: [6, 4] });
+    line(x1, y1, x2, y2, { width: width * 1.6 });
+    out.hit.lines.push([x1, y1, x2, y2]);
+    out.hit.lines.push([left, ey1, right, ey2]);
+    return out;
+  }
+
+  if (d.type === "parallelChannel" && p2 && p3) {
+    const x1 = proj.xOf(p1.time), y1 = proj.yOf(p1.price);
+    const x2 = proj.xOf(p2.time), y2 = proj.yOf(p2.price);
+    const x3 = proj.xOf(p3.time), y3 = proj.yOf(p3.price);
+    if (x1 == null || y1 == null || x2 == null || y2 == null || x3 == null || y3 == null) return null;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    const shiftX = x3 - x1, shiftY = y3 - y1;
+    const offset = nx * shiftX + ny * shiftY;
+    const x1b = x1 + nx * offset, y1b = y1 + ny * offset;
+    const x2b = x2 + nx * offset, y2b = y2 + ny * offset;
+    line(x1, y1, x2, y2, { dash: [6, 3] });
+    line(x1b, y1b, x2b, y2b, { dash: [6, 3] });
+    line(x1, y1, x1b, y1b, { width: 1 });
+    line(x2, y2, x2b, y2b, { width: 1 });
+    out.hit.lines.push([x1, y1, x2, y2]);
+    out.hit.lines.push([x1b, y1b, x2b, y2b]);
+    out.hit.bands.push([Math.min(x1,x2,x1b,x2b)-4, Math.min(y1,y2,y1b,y2b)-4, Math.abs(x2-x1)+8, Math.abs(y2-y1)+8]);
+    return out;
+  }
+
+  if (d.type === "rectangle" && p2) {
+    const x1 = proj.xOf(p1.time), y1 = proj.yOf(p1.price);
+    const x2 = proj.xOf(p2.time), y2 = proj.yOf(p2.price);
+    if (x1 == null || y1 == null || x2 == null || y2 == null) return null;
+    const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
+    const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
+    if (rw < 2 && rh < 2) return null;
+    out.bands.push({ x: rx, y: ry, w: rw, h: rh, color, alpha: style.hovered || style.selected ? 0.16 : 0.1 });
+    out.hit.bands.push([rx, ry, rw, rh]);
+    line(rx, ry, rx + rw, ry);
+    line(rx + rw, ry, rx + rw, ry + rh);
+    line(rx + rw, ry + rh, rx, ry + rh);
+    line(rx, ry + rh, rx, ry);
+    return out;
+  }
+
+  if (d.type === "circle" && p2) {
+    const x1 = proj.xOf(p1.time), y1 = proj.yOf(p1.price);
+    const x2 = proj.xOf(p2.time), y2 = proj.yOf(p2.price);
+    if (x1 == null || y1 == null || x2 == null || y2 == null) return null;
+    const r = Math.hypot(x2 - x1, y2 - y1);
+    if (r < 2) return null;
+    out.arcs.push({ cx: x1, cy: y1, r, startAngle: 0, endAngle: Math.PI * 2, color, width, alpha });
+    out.hit.bands.push([x1 - r - 4, y1 - r - 4, r * 2 + 8, r * 2 + 8]);
+    out.hit.lines.push([x1 + r, y1, x1 - r, y1]);
+    return out;
+  }
+
+  if (d.type === "priceLabel" && p1) {
+    const y = proj.yOf(p1.price);
+    if (y == null) return null;
+    const x = proj.xOf(p1.time);
+    const px = x ?? 0;
+    const text = d.text || fmtPrice(p1.price);
+    out.tags.push({ x: px + 8, y: y - 4, text, color, align: "left" });
+    line(px, y, Math.min(px + 36, proj.plotW), y, { width: 1.6 });
+    out.hit.bands.push([px - 2, y - 6, 80, 12]);
+    out.hit.lines.push([px, y, Math.min(px + 36, proj.plotW), y]);
+    return out;
+  }
+
+  if (d.type === "text" && p1) {
+    const x = proj.xOf(p1.time), y = proj.yOf(p1.price);
+    if (x == null || y == null) return null;
+    const text = d.text || "Text";
+    out.tags.push({ x: x + 6, y: y - 4, text, color, align: "left" });
+    out.hit.bands.push([x - 2, y - 14, 220, 24]);
+    return out;
+  }
+
+  if (d.type === "arrow" && p2) {
+    const x1 = proj.xOf(p1.time), y1 = proj.yOf(p1.price);
+    const x2 = proj.xOf(p2.time), y2 = proj.yOf(p2.price);
+    if (x1 == null || y1 == null || x2 == null || y2 == null) return null;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len, uy = dy / len;
+    const arrowLen = Math.min(14, len * 0.35);
+    const bx = x2 - ux * arrowLen, by = y2 - uy * arrowLen;
+    const px = -uy, py = ux;
+    line(x1, y1, x2, y2, { width: width * 1.6 });
+    line(bx + px * 4, by + py * 4, x2, y2);
+    line(bx - px * 4, by - py * 4, x2, y2);
+    out.hit.lines.push([x1, y1, x2, y2]);
+    out.hit.bands.push([Math.min(x1,x2)-4, Math.min(y1,y2)-4, Math.abs(x2-x1)+8, Math.abs(y2-y1)+8]);
     return out;
   }
 
@@ -243,7 +401,7 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
     const loss: ShapeColor = isLong ? "down" : "up";
     const hProfit = Math.abs(yTarget - yEntry);
     const hLoss = Math.abs(yStop - yEntry);
-    const strong = style.hovered || style.selected ? 0.22 : 0.15;
+    const strong = style.hovered || style.selected ? 0.24 : 0.16;
     out.bands.push({ x: left, y: Math.min(yEntry, yTarget), w: right - left, h: hProfit, color: profit, alpha: strong });
     out.bands.push({ x: left, y: Math.min(yEntry, yStop), w: right - left, h: hLoss, color: loss, alpha: strong });
     out.hit.bands.push([left, Math.min(yEntry, yTarget, yStop), right - left, Math.max(hProfit, hLoss)]);
@@ -251,8 +409,8 @@ export function buildShape(d: Drawing, proj: Projector, style: ShapeStyle, fmtPr
     line(left, yTarget, right, yTarget, { color: profit, width: 1 });
     line(left, yStop, right, yStop, { color: loss, width: 1 });
     out.tags.push({
-      x: left + 4,
-      y: Math.min(yEntry, yTarget, yStop) - 4,
+      x: left + 6,
+      y: Math.min(yEntry, yTarget, yStop) - 6,
       text: `${isLong ? "LONG" : "SHORT"}  risk ${m.riskPct.toFixed(2)}%  reward ${m.rewardPct.toFixed(2)}%  R:R ${m.rr == null ? "—" : `1:${m.rr.toFixed(2)}`}`,
       color: "text",
       align: "left",
@@ -302,11 +460,22 @@ class DrawingsRenderer implements IPrimitivePaneRenderer {
 
       for (const s of shapes) {
         for (const b of s.bands) {
-          ctx.globalAlpha = b.alpha;
+          ctx.globalAlpha = b.alpha * 0.85;
           ctx.fillStyle = resolveColor(b.color, palette);
           ctx.fillRect(b.x, b.y, b.w, b.h);
         }
       }
+      for (const s of shapes) {
+        for (const a of s.arcs) {
+          ctx.globalAlpha = a.alpha ?? 1;
+          ctx.strokeStyle = resolveColor(a.color, palette);
+          ctx.lineWidth = a.width;
+          ctx.beginPath();
+          ctx.arc(a.cx, a.cy, a.r, a.startAngle, a.endAngle);
+          ctx.stroke();
+        }
+      }
+      ctx.setLineDash([]);
       for (const s of shapes) {
         for (const l of s.lines) {
           ctx.globalAlpha = l.alpha ?? 1;
@@ -314,8 +483,6 @@ class DrawingsRenderer implements IPrimitivePaneRenderer {
           ctx.lineWidth = l.width;
           ctx.setLineDash(l.dash ?? []);
           ctx.beginPath();
-          // The half-pixel offset stops a 1px rule straddling two device rows,
-          // which is what makes a level look fuzzy.
           ctx.moveTo(l.x1 + 0.5, l.y1 + 0.5);
           ctx.lineTo(l.x2 + 0.5, l.y2 + 0.5);
           ctx.stroke();
@@ -330,8 +497,8 @@ class DrawingsRenderer implements IPrimitivePaneRenderer {
           ctx.arc(dot.x, dot.y, dot.r, 0, Math.PI * 2);
           ctx.fillStyle = dot.fill;
           ctx.fill();
-          ctx.strokeStyle = dot.stroke;
-          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = palette.selection;
+          ctx.lineWidth = 1.8;
           ctx.stroke();
         }
       }
@@ -351,10 +518,10 @@ class DrawingsRenderer implements IPrimitivePaneRenderer {
       for (const tag of s.tags) {
         const w = ctx.measureText(tag.text).width + padX * 2;
         const left = tag.align === "center" ? tag.x - w / 2 : tag.x;
-        ctx.globalAlpha = 0.94;
+        ctx.globalAlpha = 0.96;
         ctx.fillStyle = palette.labelBg;
         ctx.beginPath();
-        ctx.roundRect(left, tag.y - h + 4, w, h, 2);
+        ctx.roundRect(left, tag.y - h + 4, w, h, 3);
         ctx.fill();
         ctx.globalAlpha = 1;
         ctx.fillStyle = resolveColor(tag.color, palette);
@@ -497,11 +664,26 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
     const chart = this.chart ?? this.getChart();
     const series = this.series;
     if (!chart || !series) return null;
-    const time = chart.timeScale().coordinateToTime(x);
-    if (typeof time !== "number") return null;
-    // The price scale extrapolates below its zero point, so a press near the
-    // bottom edge of a chart of positive prices would place an invisible,
-    // negative level the user can only find again in the drawings panel.
+    const ts = chart.timeScale();
+    let time = ts.coordinateToTime(x);
+    if (typeof time !== "number") {
+      // Extrapolate beyond candle range using visible range
+      const range = ts.getVisibleRange();
+      const lr = ts.getVisibleLogicalRange();
+      if (range && lr && typeof lr.from === "number" && typeof lr.to === "number") {
+        const t1 = typeof range.from === "number" ? range.from : Number(range.from);
+        const t2 = typeof range.to === "number" ? range.to : Number(range.to);
+        const ratio = (x - ts.width() * 0) / ts.width();
+        // Better: use logical range
+        const span = t2 - t1;
+        const lspan = lr.to - lr.from;
+        if (lspan > 0 && span > 0) {
+          const logicalPos = lr.from + (x / ts.width()) * lspan;
+          time = Math.round(t1 + (logicalPos - lr.from) / lspan * span) as Time;
+        }
+      }
+    }
+    if (typeof time !== "number" || !Number.isFinite(time)) return null;
     const zero = series.priceToCoordinate(0);
     const price = series.coordinateToPrice(zero != null && y > zero - 2 ? zero - 2 : y);
     if (price == null) return null;
@@ -553,7 +735,8 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
           lines: [],
           bands: [],
           tags: [],
-          dots: [{ x: xy.x, y: xy.y, r: 4.5, fill: palette.labelBg, stroke: palette.selection }],
+          arcs: [],
+          dots: [{ x: xy.x, y: xy.y, r: 5, fill: palette.labelBg, stroke: palette.selection }],
           hit: { lines: [], bands: [], points: [[xy.x, xy.y]] },
         });
       });
@@ -568,7 +751,7 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
         if (xy) dots.push({ x: xy.x, y: xy.y, r: 3.5, fill: palette.labelBg, stroke: palette.selection });
       }
       if (dots.length) {
-        shapes.push({ id: "__pending", type: "horizontal", lines: [], bands: [], tags: [], dots, hit: { lines: [], bands: [], points: [] } });
+        shapes.push({ id: "__pending", type: "horizontal", lines: [], bands: [], arcs: [], tags: [], dots, hit: { lines: [], bands: [], points: [] } });
       }
     }
 

@@ -279,6 +279,88 @@ export function StarIcon({ size = 16, className, filled = true }: IconProps & { 
 
 /** Single caret rotated by the caller: one shape for both sort directions so
  *  the active column can never render a heavier glyph than the inactive one. */
+export function ExtendedLineIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <path d="M2 13L14 3" />
+      <path d="M2 3L14 13" opacity={0.35} />
+      <circle cx="2" cy="13" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="14" cy="3" r="1.4" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+export function ParallelChannelIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <path d="M3 3v10M6 3v10M13 3v10" />
+      <path d="M3 3h10M3 13h10" />
+    </svg>
+  );
+}
+
+export function FibExtensionIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <path d="M2 3.5h12M2 7h12M2 10.5h12M2 14h12" strokeWidth={1.2} />
+      <path d="M2 14l2-2M12 3l2 2" opacity={0.6} />
+    </svg>
+  );
+}
+
+export function RectangleIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <rect x="3" y="4.5" width="10" height="7" rx="1" />
+    </svg>
+  );
+}
+
+export function CircleIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <circle cx="8" cy="8" r="5.5" />
+    </svg>
+  );
+}
+
+export function TextIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <path d="M4 4h8M5.5 12h5" />
+      <path d="M6.5 4v8M9.5 4v8" opacity={0.5} />
+    </svg>
+  );
+}
+
+export function ArrowIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <path d="M3 11L13 5" />
+      <path d="M9 5h4M13 5l-.1 3.5" />
+    </svg>
+  );
+}
+
+export function PriceLabelIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <path d="M2 8h12" />
+      <rect x="5.5" y="4.5" width="5" height="3" rx="1" />
+      <path d="M8 7.5v4M7 11.5h2" />
+    </svg>
+  );
+}
+
+export function DuplicateIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className} aria-hidden="true">
+      <rect x="3" y="4" width="9" height="7" rx="1" />
+      <path d="M7 3h6v6" />
+    </svg>
+  );
+}
+
 export function CaretIcon({ size = 16, className }: IconProps) {
   return (
     <svg {...base(size)} className={className} aria-hidden="true">
