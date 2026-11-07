@@ -148,30 +148,53 @@ export function drawingTypeForTool(tool: ChartTool): DrawingType | null {
   return TOOL_TYPE[tool] ?? null;
 }
 
+/** Default colour per drawing type.
+ *
+ *  These are palette *keywords*, not hex: the renderer resolves them against the
+ *  live theme, which is the only way one default can be legible on both the dark
+ *  and the white chart (a near-white trendline vanished on the light theme, a
+ *  near-black one swallows the candles on the dark one). Drawings are ink by
+ *  default and colour is a choice the user makes from the swatch row; long/short
+ *  keep the semantic green/red because profit and loss have to be separable at a
+ *  glance whatever the rest of the chart is wearing. */
 export const COLORS: Record<DrawingType, string> = {
-  horizontal: "#f59e0b",
-  vertical: "#8b5cf6",
-  // Not #e2e8f0: a near-white trendline was invisible on the light theme, which
-  // made trendlines look broken there. This grey has contrast in both.
-  trendline: "#8f9bb3",
-  ray: "#38bdf8",
-  extendedLine: "#8f9bb3",
-  parallelChannel: "#38bdf8",
-  fibonacci: "#f59e0b",
-  fibExtension: "#f59e0b",
-  measure: "#38bdf8",
-  rectangle: "#8b5cf6",
-  circle: "#8b5cf6",
-  text: "#f59e0b",
-  arrow: "#38bdf8",
-  priceLabel: "#f59e0b",
-  longPosition: "#10b981",
-  shortPosition: "#f43f5e",
+  horizontal: "ink",
+  vertical: "ink",
+  trendline: "ink",
+  ray: "ink",
+  extendedLine: "ink",
+  parallelChannel: "ink",
+  fibonacci: "ink",
+  fibExtension: "ink",
+  measure: "ink",
+  rectangle: "ink",
+  circle: "ink",
+  text: "ink",
+  arrow: "ink",
+  priceLabel: "ink",
+  longPosition: "up",
+  shortPosition: "down",
 };
 
-/** Swatches offered on the selected shape. Small set on purpose: recoloring is
- *  a quick tidy-up, not a paint app, and every extra swatch costs toolbar width. */
-export const PALETTE = ["#8f9bb3", "#f59e0b", "#38bdf8", "#10b981", "#f43f5e", "#8b5cf6"];
+/** Swatches offered on the selected shape. Four of the seven are palette
+ *  keywords rather than hex, so they resolve through the chart's own theme the
+ *  way the canvas does: a fixed "#10b981" that looks right on the dark chart is
+ *  the wrong green on the light one, and a grey literal is invisible on both
+ *  eventually. Small set on purpose: recoloring is a quick tidy-up, not a paint
+ *  app, and every extra swatch costs menu width. */
+export const PALETTE = ["ink", "muted", "#f59e0b", "#38bdf8", "up", "down", "#8b5cf6"];
+
+/** What a swatch is called in the menu and the list. Keywords get words because
+ *  "Set colour ink" is a sentence a screen reader can actually act on. */
+export const COLOR_LABEL: Record<string, string> = {
+  ink: "chart ink",
+  muted: "soft grey",
+  up: "bull green",
+  down: "bear red",
+  "#f59e0b": "amber",
+  "#38bdf8": "sky",
+  "#8b5cf6": "violet",
+};
 
 /**
  * Third click of a position tool: mirror the risk distance so the shape is

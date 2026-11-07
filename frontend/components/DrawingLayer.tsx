@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useState, type RefObject } from "react";
 import type { IChartApi, MouseEventParams } from "lightweight-charts";
 import { useChartStore, selectDrawings } from "@/lib/store/chartStore";
-import { PALETTE, TYPE_LABEL, drawingForTool, isPlacementTool, pointsRequired } from "@/lib/utils/drawings";
-import { parseHit, type DrawingsPrimitive } from "@/lib/chart/drawingsPrimitive";
+import { COLOR_LABEL, PALETTE, TYPE_LABEL, drawingForTool, isPlacementTool, pointsRequired } from "@/lib/utils/drawings";
+import { parseHit, resolveColor, type DrawingsPrimitive, type ShapeColor } from "@/lib/chart/drawingsPrimitive";
+import { chartPalette } from "@/lib/chart/theme";
+import { useThemeStore } from "@/lib/store/themeStore";
 import { EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon, DuplicateIcon } from "@/components/icons/ToolIcons";
 import type { ChartTool, Drawing, DrawingPoint } from "@/lib/types";
 
@@ -33,7 +35,8 @@ type Gesture =
 const DRAG_SLOP = 3;
 const MIN_ANCHOR_GAP = 2;
 
-const MENU_W = 150;
+/** Matches the menu's own box, so the clamp can keep all of it inside the chart. */
+const MENU_W = 172;
 const MENU_H = 168;
 
 /**
@@ -426,6 +429,12 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
  *  cannot be clicked. */
 function ContextMenu({ id, symbol, at, onClose }: { id: string; symbol: string; at: { x: number; y: number }; onClose: () => void }) {
   const d = useChartStore((s) => (s.drawingsBySymbol[symbol] ?? []).find((x) => x.id === id));
+  const theme = useThemeStore((s) => s.theme);
+  /** A palette keyword ("ink", "up") is not a CSS colour, and the canvas resolves
+   *  it at paint time — so the swatch has to resolve it the same way, or the
+   *  default colour would preview as nothing and never read as "currently set". */
+  const palette = chartPalette(theme);
+  const cssOf = (c: string) => resolveColor(c as ShapeColor, palette);
 
   // Close on any press outside the menu, and on Escape.
   useEffect(() => {
@@ -454,10 +463,10 @@ function ContextMenu({ id, symbol, at, onClose }: { id: string; symbol: string; 
           <button
             key={c}
             className="ctx-swatch"
-            style={{ "--swatch": c } as React.CSSProperties}
-            data-active={d.color === c}
-            title={`Colour ${c}`}
-            aria-label={`Set colour ${c}`}
+            style={{ "--swatch": cssOf(c) } as React.CSSProperties}
+            data-active={cssOf(d.color) === cssOf(c)}
+            title={`Colour ${COLOR_LABEL[c] ?? c}`}
+            aria-label={`Set colour ${COLOR_LABEL[c] ?? c}`}
             onClick={run(() => st.updateDrawing(symbol, d.id, { color: c }))}
           />
         ))}

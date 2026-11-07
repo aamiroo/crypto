@@ -30,6 +30,11 @@ html, body { height: 100%; overflow: hidden; }
   --chart-crosshair: #3f4550;
   --candle-up: #10b981;
   --candle-down: #f43f5e;
+  /* Ink for chart annotations. Not --accent: the accent is the interface's own
+     colour (active tool, selection, focus), and a drawing that wears it cannot
+     be told apart from a control. Not a fixed hex either — a single colour that
+     is bright enough for the dark chart is washed out on the white one. */
+  --draw-ink: #b8c2d2;
   --accent: #f59e0b;
   --accent-contrast: #1a1200;
   --success: #10b981;
@@ -60,6 +65,7 @@ html, body { height: 100%; overflow: hidden; }
   --chart-crosshair: #9aa3af;
   --candle-up: #12b886;
   --candle-down: #e03131;
+  --draw-ink: #5f6b7d;
   --accent: #d97706;
   --accent-contrast: #ffffff;
   --success: #12b886;
@@ -197,6 +203,19 @@ body {
 }
 .rail-btn-wide { width: auto; gap: 2px; padding: 0 4px; }
 
+/* Hairline between tool families inside the rail. It is 1px of the recessed
+   strip's own shadow rather than a new border colour, so the rail still reads
+   as one control with four groups in it. */
+.rail-sep {
+  width: 1px;
+  height: 15px;
+  flex-shrink: 0;
+  margin: 0 2px;
+  border-radius: 1px;
+  background: var(--border-strong);
+  opacity: 0.55;
+}
+
 /* Keep-armed badge: a pinned tool draws shape after shape, so it has to look
    different from a tool that returns to the cursor after one click. */
 .rail-btn[data-sticky="true"]::after,
@@ -262,7 +281,7 @@ body {
   z-index: 50;
   display: flex;
   flex-direction: column;
-  min-width: 150px;
+  min-width: 172px;
   padding: 3px;
   font-size: 11px;
   border-radius: 7px;
@@ -295,18 +314,35 @@ body {
 .ctx-swatches {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 4px 7px 5px;
+  gap: 6px;
+  padding: 5px 7px 6px;
 }
 .ctx-swatch {
-  width: 14px;
-  height: 14px;
+  position: relative;
+  width: 15px;
+  height: 15px;
   border-radius: 9999px;
   background: var(--swatch);
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+  transition: transform 120ms ease, box-shadow 120ms ease;
 }
+.ctx-swatch:hover { transform: scale(1.12); }
 .ctx-swatch[data-active="true"] {
   box-shadow: 0 0 0 1.5px var(--bg-elevated), 0 0 0 3px var(--accent);
+}
+/* A tick, not only a ring: two of the swatches are greys one step apart, and a
+   ring at this size is easy to miss while a check is not. */
+.ctx-swatch[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 2.5px;
+  width: 4px;
+  height: 7px;
+  border: solid var(--bg-elevated);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+  opacity: 0.92;
 }
 
 /* Floating cards over the chart (drawings list, selection actions). Opaque like

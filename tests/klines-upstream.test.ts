@@ -71,11 +71,12 @@ function liveCandle(n: number) {
 type StubReply = { ok: boolean; status: number; json(): Promise<unknown> };
 
 /** Intercept the gateway's calls to the venue only — the test's own requests
- *  have to keep reaching the real HTTP server. */
+ *  have to keep reaching the real HTTP server. Every host the gateway may fall
+ *  back to is covered: a stubbed 403 must not escape to the real alternates. */
 async function withVenueStub<T>(handler: (url: string) => Promise<StubReply>, run: () => Promise<T>): Promise<T> {
   const prev = globalThis.fetch;
   globalThis.fetch = async (input: unknown, init?: unknown) =>
-    String(input).includes("api.bybit.com")
+    /api\.(bybit\.com|bytick\.com|bybit\.nl|bybit\.kz)/.test(String(input))
       ? (handler(String(input)) as unknown as Promise<Response>)
       : (prev(input as never, init as never) as Promise<Response>);
   try { return await run(); } finally { globalThis.fetch = prev; }

@@ -23,6 +23,10 @@ export interface ChartPalette {
   labelText: string;
   /** Colour of the price/time axis tags the chart draws for a selected shape. */
   selection: string;
+  /** Default stroke colour of a drawing. Drawings are ink, not hue: an
+   *  annotation should read as part of the chart it sits on, and a colour that
+   *  is chosen per theme is the only way one default can be legible on both. */
+  drawInk: string;
   fontSize: number;
   fontFamily: string;
 }
@@ -43,6 +47,7 @@ const FALLBACK: ChartPalette = {
   labelBg: "#12161b",
   labelText: "#a6adb8",
   selection: "#f59e0b",
+  drawInk: "#b8c2d2",
   fontSize: 11,
   fontFamily: "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
 };
@@ -82,6 +87,7 @@ function readVars(el: Element): ChartPalette {
     labelBg: get("--bg-elevated", FALLBACK.labelBg),
     labelText: get("--text-secondary", FALLBACK.labelText),
     selection: get("--accent", FALLBACK.selection),
+    drawInk: get("--draw-ink", FALLBACK.drawInk),
     fontSize: FALLBACK.fontSize,
     fontFamily: get("--font-ui", FALLBACK.fontFamily),
   };

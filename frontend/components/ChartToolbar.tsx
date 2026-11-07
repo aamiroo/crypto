@@ -8,41 +8,16 @@ import { ChartSettingsMenu } from "@/components/ChartSettingsMenu";
 import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
 import { TOOL_GROUPS, toolsInGroup } from "@/lib/utils/drawings";
 import {
-  ArrowIcon, CaretIcon, CircleIcon, CursorIcon, DuplicateIcon, EyeIcon, EyeOffIcon, ExpandIcon, CollapseIcon,
-  ExtendedLineIcon, FibonacciIcon, FibExtensionIcon, HorizontalIcon, LayersIcon, LongPositionIcon, MeasureIcon, ParallelChannelIcon,
-  PriceLabelIcon, RayIcon, RectangleIcon, RedoIcon, ShortPositionIcon, TextIcon, TrashIcon, TrendlineIcon, UndoIcon, VerticalIcon,
+  CaretIcon, CollapseIcon, ExpandIcon, EyeIcon, EyeOffIcon, LayersIcon, RedoIcon, TrashIcon, UndoIcon, TOOL_ICON,
 } from "@/components/icons/ToolIcons";
 import type { ToolDef } from "@/lib/utils/drawings";
 import type { ChartTool } from "@/lib/types";
-import type { ReactElement } from "react";
 
 const CHART_TYPES = [
   { id: "candlestick", label: "Candles" },
   { id: "line", label: "Line" },
   { id: "area", label: "Area" },
 ] as const;
-
-/** Tool rail icons, keyed by tool id so the list in lib/utils/drawings stays
- *  the single source for order, labels and shortcuts. */
-const TOOL_ICON: Record<ChartTool, (p: { size?: number }) => ReactElement> = {
-  crosshair: CursorIcon,
-  horizontal: HorizontalIcon,
-  vertical: VerticalIcon,
-  trendline: TrendlineIcon,
-  extendedLine: ExtendedLineIcon,
-  ray: RayIcon,
-  parallelChannel: ParallelChannelIcon,
-  fibonacci: FibonacciIcon,
-  fibExtension: FibExtensionIcon,
-  measure: MeasureIcon,
-  rectangle: RectangleIcon,
-  circle: CircleIcon,
-  text: TextIcon,
-  arrow: ArrowIcon,
-  priceLabel: PriceLabelIcon,
-  longPosition: LongPositionIcon,
-  shortPosition: ShortPositionIcon,
-};
 
 /** Long/short keep their semantic colour everywhere, including the rail. */
 function toolColor(id: ChartTool): string | undefined {
@@ -86,21 +61,26 @@ export function ChartToolbar({ symbol }: { symbol: string }) {
       style={{ borderColor: "var(--border)", background: "var(--bg-panel)" }}
     >
       <div className="tool-rail">
-        {TOOL_GROUPS.map((g) => {
+        {TOOL_GROUPS.map((g, i) => {
           const items = toolsInGroup(g.id);
           const single = items.length === 1 ? items[0] : null;
-          if (single) return <ToolButton key={g.id} tool={single} armed={activeTool} sticky={stickyTool} onPick={pick} />;
-          return (
-            <ToolFlyout
-              key={g.id}
-              label={g.label}
-              items={items}
-              shown={lastOf[g.id] ?? items[0]!.id}
-              armed={activeTool}
-              sticky={stickyTool}
-              onPick={pick}
-            />
-          );
+          const node = single
+            ? <ToolButton key={g.id} tool={single} armed={activeTool} sticky={stickyTool} onPick={pick} />
+            : (
+              <ToolFlyout
+                key={g.id}
+                label={g.label}
+                items={items}
+                shown={lastOf[g.id] ?? items[0]!.id}
+                armed={activeTool}
+                sticky={stickyTool}
+                onPick={pick}
+              />
+            );
+          // Four families, four reads: the cursor, the lines, the measurements,
+          // the risk tools. A hairline between them is what turns nine glyphs
+          // into four groups the eye can parse before the tooltip appears.
+          return i === 0 ? node : [<span key={`${g.id}-sep`} className="rail-sep" />, node];
         })}
       </div>
 

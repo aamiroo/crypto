@@ -2,9 +2,12 @@
 
 import { useChartStore, selectDrawings } from "@/lib/store/chartStore";
 import { useUiStore } from "@/lib/store/uiStore";
-import { TYPE_LABEL, positionMetrics } from "@/lib/utils/drawings";
+import { COLOR_LABEL, TYPE_LABEL, positionMetrics } from "@/lib/utils/drawings";
+import { resolveColor } from "@/lib/chart/drawingsPrimitive";
+import { chartPalette } from "@/lib/chart/theme";
+import { useThemeStore } from "@/lib/store/themeStore";
 import { fmtPrice } from "@/lib/utils/format";
-import { CloseIcon, EyeIcon, EyeOffIcon, LockIcon, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
+import { CloseIcon, EyeIcon, EyeOffIcon, LockIcon, TOOL_ICON, TrashIcon, UnlockIcon } from "@/components/icons/ToolIcons";
 import type { Drawing } from "@/lib/types";
 
 /**
@@ -52,6 +55,13 @@ function Row({ d, symbol, selected }: { d: Drawing; symbol: string; selected: bo
   const setActiveTool = useChartStore((s) => s.setActiveTool);
   const updateDrawing = useChartStore((s) => s.updateDrawing);
   const removeDrawing = useChartStore((s) => s.removeDrawing);
+  const theme = useThemeStore((s) => s.theme);
+  /** The row is drawn in the colour the shape is drawn in, and a palette keyword
+   *  ("ink", "up") only means something through the chart's palette — the same
+   *  resolution the canvas and the right-click swatches use. */
+  const ink = resolveColor(d.color, chartPalette(theme));
+  const Icon = TOOL_ICON[d.type];
+  const dim = d.visible === false;
 
   // Selecting from the list must actually give you the shape: while a placement
   // tool is armed every click draws, so the cursor tool comes first.
@@ -69,8 +79,10 @@ function Row({ d, symbol, selected }: { d: Drawing; symbol: string; selected: bo
         borderLeft: `2px solid ${selected ? "var(--accent)" : "transparent"}`,
       }}
     >
-      <span className="h-2 w-2 flex-shrink-0 rounded-full" style={{ background: d.color, opacity: d.visible === false ? 0.3 : 1 }} />
-      <span className="min-w-0 flex-1 truncate text-[11px]" style={{ color: d.visible === false ? "var(--text-muted)" : "var(--text-secondary)" }}>
+      <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center" style={{ color: ink, opacity: dim ? 0.35 : 1 }} title={COLOR_LABEL[d.color] ?? "custom colour"}>
+        <Icon size={13} />
+      </span>
+      <span className="min-w-0 flex-1 truncate text-[11px]" style={{ color: dim ? "var(--text-muted)" : "var(--text-secondary)" }}>
         {TYPE_LABEL[d.type]}
         <span className="ml-1 tabular-nums" style={{ color: "var(--text-muted)" }}>{detail(d, symbol)}</span>
       </span>

@@ -13,6 +13,33 @@ const gzipAsync = promisify(gzip);
 
 const WS_PATH = "/ws";
 const BYBIT_REST = process.env.BYBIT_REST || "https://api.bybit.com";
+/** api.bybit.com sits behind a CloudFront distribution that answers some
+ *  networks with a flat 403. These are Bybit's own alternate REST hosts, tried
+ *  in order when the primary refuses the connection. An operator-pinned
+ *  BYBIT_REST is honoured alone: a test or a private proxy must never have its
+ *  failures silently rerouted to the public venue. */
+const BYBIT_HOSTS = process.env.BYBIT_REST
+  ? [BYBIT_REST]
+  : [BYBIT_REST, "https://api.bytick.com", "https://api.bybit.nl", "https://api.bybit.kz"];
+/** The host that answered last, probed first on the next call. */
+let venueHostIndex = 0;
+/** A host that just refused us is skipped for a while, so probes settle on the
+ *  one that answers instead of re-trying a banned host every cycle. Without this
+ *  the global circuit keeps re-opening on the same blocked host and the history
+ *  crawl — which only goes out while the circuit is clear — never gets a turn.
+ *  A geo-block lasts minutes, so the skip is sized like the crawl's own backoff
+ *  cap: long enough that the working host gets an uninterrupted run to heal. */
+const HOST_BLOCK_MS = 300_000;
+const hostBlockedUntil = BYBIT_HOSTS.map(() => 0);
+function pickVenueHost() {
+  const n = BYBIT_HOSTS.length;
+  const now = Date.now();
+  for (let i = 0; i < n; i++) {
+    const idx = (venueHostIndex + i) % n;
+    if (hostBlockedUntil[idx] <= now) return idx;
+  }
+  return venueHostIndex;
+}
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,OPTIONS",
@@ -398,9 +425,12 @@ function createKlinesFetcher({ store, logger }) {
 
     // A backfill page we already hold in full is not a reason to call the venue:
     // historical candles never change, and this is what makes scroll-back local.
+    // The crawl is excepted: its gap pages ask for a range the mirror is missing
+    // by definition, and `candlesBefore` would hand back the bars *before* the
+    // hole — a full page that heals nothing. Only the venue can fill a gap.
     if (endTime) {
       const held = store?.candlesBefore(symbol, interval, endTime, limit);
-      if (held && held.length >= limit) {
+      if (held && held.length >= limit && !opts.background) {
         const page = { data: held, source: "mirror" };
         cache.set(key, { at: Date.now(), ...page });
         trimCache();
@@ -548,12 +578,27 @@ async function fetchFromVenue(symbol, interval, limit, endTime, timeoutMs, logge
   });
   // Optional backfill window: candles strictly before `endTime` (ms).
   if (endTime) params.set("end", String(endTime));
-  const r = await fetch(`${BYBIT_REST}/v5/market/kline?${params}`, {
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; CryptoTerminal/1.0)" },
-  });
-  if (!r.ok) throw new Error(`Bybit HTTP ${r.status}`);
-  const j = await r.json();
+  // One host per attempt: the lane's cool-offs are what pace retries, so a
+  // blocked venue must not cost one send per alternate inside a single probe.
+  // A host that refuses the connection, hangs, or answers with a block page
+  // instead of JSON is skipped for a while; the next attempt goes to the next
+  // official host until one answers, and that host then stays in use.
+  const idx = pickVenueHost();
+  let j;
+  try {
+    const r = await fetch(`${BYBIT_HOSTS[idx]}/v5/market/kline?${params}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; CryptoTerminal/1.0)" },
+    });
+    if (!r.ok) throw new Error(`Bybit HTTP ${r.status}`);
+    j = await r.json();
+  } catch (err) {
+    hostBlockedUntil[idx] = Date.now() + HOST_BLOCK_MS;
+    venueHostIndex = (idx + 1) % BYBIT_HOSTS.length;
+    throw err;
+  }
+  venueHostIndex = idx;
+  hostBlockedUntil[idx] = 0;
   if (j.retCode !== 0) throw new Error(j.retMsg || `Bybit error ${j.retCode}`);
   const list = j.result?.list;
   if (!Array.isArray(list)) throw new Error("No kline data");
