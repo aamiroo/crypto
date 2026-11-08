@@ -106,7 +106,7 @@ export type DrawingType =
   | "longPosition" | "shortPosition";
 
 export interface DrawingPoint {
-  /** Bar open time in ms. */
+  /** Bar open time in UTC seconds (the chart's time scale). */
   time: number;
   price: number;
 }

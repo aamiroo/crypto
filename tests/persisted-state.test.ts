@@ -52,7 +52,7 @@ test("sanitizeDrawings: never returns a shape the renderer cannot anchor", () =>
       { ...trendline(), id: "ghost", symbol: "ETHUSDT" },
       { ...trendline(), id: "nopoints", points: [] },
       { ...trendline(), id: "badpoints", points: [{ time: "1", price: null }] },
-      { ...trendline(), id: "badtype", type: "text" },
+      { ...trendline(), id: "badtype", type: "heikinashi" },
       { ...trendline(), id: "nocolor", color: undefined },
     ],
     numberkey: 7,

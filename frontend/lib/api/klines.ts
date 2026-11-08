@@ -1,6 +1,6 @@
 import { useMarketStore, klineTickCursor } from "@/lib/store/marketStore";
 import {
-  EMPTY_KLINES, MAX_KLINES, isCurrentBar, klineKey, normalizeKlines,
+  EMPTY_KLINES, MAX_KLINES, isCurrentBar, klineKey, missingHistory, normalizeKlines,
 } from "@/lib/utils/klines";
 import type { KlineData, Timeframe } from "@/lib/types";
 
@@ -203,18 +203,25 @@ export function hasRecentTail(klines: KlineData[]): boolean {
 }
 
 /**
- * Heal a frozen right-hand edge: re-pull the recent window, but only when the
- * stored one no longer reaches now. Used for events that can silently stall
- * delivery (a backgrounded tab throttles timers and WebSocket handling without
- * the socket ever reporting a drop). Skips when a load is pending or failing —
- * that path owns its own retry ladder. Returns whether the window is live.
+ * Heal a frozen right-hand edge or an interior gap the gateway may have filled
+ * since this window was served. Used for events that can silently stall delivery
+ * (a backgrounded tab throttles timers and WebSocket handling without the socket
+ * ever reporting a drop) and for the chart's gap poll. Skips when a load is
+ * pending or failing — that path owns its own retry ladder. Returns whether the
+ * window is live.
  */
 export async function refreshRecentKlines(symbol: string, interval: Timeframe | string): Promise<boolean> {
   const key = klineKey(symbol, interval);
   const state = useMarketStore.getState();
   const existing = state.klines[symbol]?.[interval] ?? EMPTY_KLINES;
-  if (hasRecentTail(existing)) return true;
+  const live = hasRecentTail(existing);
+  const missing = missingHistory(existing, interval as Timeframe).bars;
+  if (live && missing === 0) return true;
   if (state.klineStatus[key]?.state !== "ready") return false;
+  // The gateway has already asked the venue and been told there is nothing
+  // there; re-pulling the same page cannot turn an absent bar into a present one.
+  const historyStatus = state.klineStatus[key]?.historyStatus;
+  if (live && missing > 0 && (historyStatus === "complete" || historyStatus === "exhausted")) return true;
 
   const last = lastRefreshAt.get(key) ?? 0;
   if (Date.now() - last < REFRESH_MIN_MS) return false;

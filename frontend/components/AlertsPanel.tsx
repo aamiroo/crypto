@@ -7,6 +7,7 @@ import { useMarketStore } from "@/lib/store/marketStore";
 import { fmtPrice, fmtTime } from "@/lib/utils/format";
 import { baseAsset } from "@/lib/utils/symbol";
 import { CloseIcon } from "@/components/icons/ToolIcons";
+import { toast } from "@/lib/store/toastStore";
 import type { AlertCondition } from "@/lib/types";
 
 export function AlertsPanel() {
@@ -29,6 +30,7 @@ export function AlertsPanel() {
     const p = price ? parseFloat(price) : last;
     if (!Number.isFinite(p) || p <= 0) return;
     addAlert({ symbol, condition, price: p });
+    toast("success", `Alert set: ${baseAsset(symbol)} ${condition === "above" ? "≥" : "≤"} ${fmtPrice(p, symbol)}`, 3500);
     setPrice("");
   };
 
@@ -91,13 +93,16 @@ export function AlertsPanel() {
           {alerts.length === 0 ? (
             <div className="py-6 text-center text-[11px]" style={{ color: "var(--text-muted)" }}>No alerts yet</div>
           ) : (
-            alerts.map((a) => (
+            [...alerts].sort((a, b) => Number(!!a.triggeredAt) - Number(!!b.triggeredAt) || b.createdAt - a.createdAt).map((a) => (
               <div key={a.id} className="flex items-center gap-2 border-b py-1.5 text-[11px] last:border-0" style={{ borderColor: "var(--border)" }}>
                 <span className="w-12 font-medium" style={{ color: "var(--text-secondary)" }}>{baseAsset(a.symbol)}</span>
-                <span style={{ color: a.triggeredAt ? "var(--warning)" : "var(--text-primary)" }}>{conditionLabel(a.condition)}</span>
-                <span className="flex-1 tabular-nums" style={{ color: "var(--text-primary)" }}>{fmtPrice(a.price, a.symbol)}</span>
+                <span style={{ color: a.triggeredAt ? "var(--warning)" : "var(--text-secondary)" }}>{conditionLabel(a.condition)}</span>
+                <span className="flex-1 tabular-nums font-medium" style={{ color: a.triggeredAt ? "var(--warning)" : "var(--text-primary)" }}>{fmtPrice(a.price, a.symbol)}</span>
                 {a.triggeredAt && (
-                  <span className="text-[9px]" style={{ color: "var(--warning)" }} title={`Fired ${fmtTime(a.triggeredAt)}`}>fired</span>
+                  <span className="rounded px-1 py-px text-[9px] font-semibold" style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 14%, transparent)" }} title={a.triggeredPrice != null ? `Fired at ${fmtPrice(a.triggeredPrice, a.symbol)} · ${fmtTime(a.triggeredAt)}` : `Fired ${fmtTime(a.triggeredAt)}`}>FIRED</span>
+                )}
+                {!a.triggeredAt && (
+                  <span className="rounded px-1 py-px text-[9px]" style={{ color: "var(--text-muted)", background: "var(--bg-surface)" }}>active</span>
                 )}
                 <button onClick={() => removeAlert(a.id)} className="icon-btn h-5 w-5" title="Remove alert" aria-label="Remove alert"><CloseIcon size={11} /></button>
               </div>
@@ -115,7 +120,7 @@ export function AlertsPanel() {
           </button>
         )}
         <p className="mt-2 text-[10px] leading-snug" style={{ color: "var(--text-muted)" }}>
-          Alerts are evaluated locally against the live ticker feed while this tab is open.
+          Alerts are evaluated locally against the live ticker feed while this tab is open. You&apos;ll see a toast when one fires.
         </p>
       </div>
     </div>

@@ -548,6 +548,10 @@ export const SWITCH_VISIBLE_BARS = 120;
 /** Empty slots kept to the right of the newest bar (matches the chart's
  *  `rightOffset`), so the last candle is never glued to the price axis. */
 export const SWITCH_RIGHT_PAD = 10;
+/** Empty slots the first fit may cross while walking back for candles. Past
+ *  this, an outage would occupy more of the screen than the price history it is
+ *  supposed to separate, so the fit stays on the newest side of the hole. */
+const SWITCH_MAX_GAP_SLOTS = SWITCH_VISIBLE_BARS;
 
 /**
  * Logical (index-based) range to show after a timeframe change: newest bars
@@ -556,16 +560,22 @@ export const SWITCH_RIGHT_PAD = 10;
  *  pays for the holes it crosses — otherwise a window with an outage in its
  *  recent past would open on 120 slots of which a handful are candles, which is
  *  exactly the "chart that failed to load" this re-fit exists to prevent.
- *  `from` is clamped at 0 because a short window has nothing to the left.
+ *  A huge outage is not crossed at all: the live edge stays readable and the
+ *  badge reports what is absent. `from` is clamped at 0 because a short window
+ *  has nothing to the left.
  */
 export function switchVisibleRange(klines: KlineData[]): { from: number; to: number } {
   const total = slotCount(klines);
   if (total === 0) return { from: 0, to: SWITCH_RIGHT_PAD };
   let candles = 1;
   let slots = 1;
+  let gaps = 0;
   while (candles < SWITCH_VISIBLE_BARS && klines.length - candles > 0) {
     const i = klines.length - candles;
-    slots += Math.min(gapHoles(klines[i - 1]!, klines[i]!), MAX_GAP_SLOTS) + 1;
+    const holes = Math.min(gapHoles(klines[i - 1]!, klines[i]!), MAX_GAP_SLOTS);
+    if (gaps + holes > SWITCH_MAX_GAP_SLOTS) break;
+    slots += holes + 1;
+    gaps += holes;
     candles += 1;
   }
   return { from: Math.max(0, total - slots), to: total + SWITCH_RIGHT_PAD };

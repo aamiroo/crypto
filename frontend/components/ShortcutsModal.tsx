@@ -28,8 +28,8 @@ export function ShortcutsModal() {
           <button onClick={() => setOpen(false)} className="icon-btn h-6 w-6" aria-label="Close"><CloseIcon size={13} /></button>
         </div>
         <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
-          {SHORTCUTS.map((s) => (
-            <div key={s.keys} className="flex items-center justify-between gap-3 rounded px-2 py-1.5" style={{ background: "var(--bg-surface)" }}>
+          {SHORTCUTS.map((s, i) => (
+            <div key={`${i}-${s.keys}`} className="flex items-center justify-between gap-3 rounded px-2 py-1.5" style={{ background: "var(--bg-surface)" }}>
               <span className="text-xs" style={{ color: "var(--text-secondary)" }}>{s.label}</span>
               <kbd className="rounded border px-1.5 py-0.5 text-[10px] font-semibold" style={{ borderColor: "var(--border-strong)", color: "var(--text-primary)", background: "var(--bg-primary)" }}>{s.keys}</kbd>
             </div>

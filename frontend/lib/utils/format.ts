@@ -55,6 +55,31 @@ export function fmtDate(ts: number): string {
   return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+/** Full local date+time for chart/candle labels (complete and readable). */
+export function fmtDateTime(ts: number): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+/** Candle time label: include date for slower intervals/context, always complete. */
+export function fmtCandleTime(ts: number, timeframe?: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "—";
+  const tf = String(timeframe ?? "").toLowerCase();
+  const showDate = /d|w|m$|h/.test(tf) || true; // always show complete date+time for correctness
+  if (showDate) return fmtDateTime(ts);
+  return d.toLocaleTimeString("en-US", { hour12: false });
+}
+
 /** Flash color for price change direction */
 export function priceFlashClass(prev: number, next: number): string {
   if (next > prev) return "flash-green";

@@ -54,9 +54,7 @@ interface ChartState {
 
 const INDICATOR_TYPES = new Set<IndicatorConfig["type"]>(["sma", "ema", "rsi", "macd", "bb", "vol"]);
 const CHART_TYPES = new Set<ChartType>(["candlestick", "line", "area"]);
-const DRAWING_TYPES = new Set<Drawing["type"]>([
-  "horizontal", "vertical", "trendline", "ray", "fibonacci", "measure", "longPosition", "shortPosition",
-]);
+const DRAWING_TYPES = new Set<Drawing["type"]>(Object.keys(COLORS) as Drawing["type"][]);
 const TF_SET = new Set<string>(TIMEFRAMES);
 
 /** Default period per type, used only when a cached indicator lost its own. */

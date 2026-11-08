@@ -975,11 +975,11 @@ export function createKlinesStore({ file, dir, legacyFile = LEGACY_FILE, logger,
      *  Async: the first append for a cold window reads the mirror file off the
      *  event loop instead of stalling the bus callback that feeds this method.
      */
-    async append(symbol, interval, k) {
+    append(symbol, interval, k) {
       const tuple = toValidTuple(k, interval);
       if (!tuple) return false;
       const openTime = tuple[0];
-      const w = await openWindowAsync(symbol, interval);
+      const w = openWindow(symbol, interval);
       if (!w.loaded) return false;
       const candles = w.candles ?? [];
       const last = candles[candles.length - 1];

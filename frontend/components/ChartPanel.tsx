@@ -17,7 +17,7 @@ import {
 import { useMarketStore, selectKlines, type KlineStatus } from "@/lib/store/marketStore";
 import { useChartStore } from "@/lib/store/chartStore";
 import { sma, ema, rsi, macd, bollinger, klineCloses } from "@/lib/utils/indicators";
-import { fmtPrice, fmtVolume, fmtTime } from "@/lib/utils/format";
+import { fmtPrice, fmtVolume, fmtDateTime } from "@/lib/utils/format";
 import { getPriceDecimals } from "@/lib/utils/symbol";
 import { useThemeStore } from "@/lib/store/themeStore";
 import { chartPalette, withAlpha } from "@/lib/chart/theme";
@@ -25,10 +25,10 @@ import { DrawingsPrimitive, type DrawingsSource } from "@/lib/chart/drawingsPrim
 import { DrawingController } from "@/components/DrawingLayer";
 import { DrawingsPanel } from "@/components/DrawingsPanel";
 import {
-  EMPTY_KLINES, RECENT_TAIL_MS, buildTimeIndex, diffKlines, gapHoles, klineKey, missingHistory,
+  EMPTY_KLINES, RECENT_TAIL_MS, TIMEFRAME_SPAN_MS, buildTimeIndex, diffKlines, gapHoles, klineKey, missingHistory,
   slotCount, switchVisibleRange, toCandleBars, toIndicatorBars, toLineBars, toVolumeBars,
 } from "@/lib/utils/klines";
-import { loadHistoricalKlines, loadOlderKlines } from "@/lib/api/klines";
+import { loadHistoricalKlines, loadOlderKlines, refreshRecentKlines } from "@/lib/api/klines";
 import { RESET_VIEW_EVENT } from "@/lib/hooks/useKeyboardShortcuts";
 import type { ChartType, IndicatorConfig, KlineData, Timeframe } from "@/lib/types";
 
@@ -39,6 +39,8 @@ const OSC_STRETCH = 0.22;
 const VOLUME_BAND = 0.18;
 /** Start fetching older history once the left edge gets within this many bars. */
 const LOAD_MORE_THRESHOLD = 5;
+/** Re-pull a gapped window while the gateway may still be healing it. */
+const GAP_HEAL_POLL_MS = 30_000;
 
 type AltKind = "line" | "area";
 type AltSeries = ISeriesApi<"Line" | "Area">;
@@ -72,6 +74,12 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   /** The series driving the right price scale for the active chart type. */
   const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
   const primRef = useRef<DrawingsPrimitive | null>(null);
+  // Only one drawing gesture layer per panel: DrawingController owns the
+  // pointer gestures and the menu for this chart. Its props are fresh every
+  // render, and `epoch` is bumped inside the chart lifecycle effect below
+  // whenever the chart is recreated (new `chRef`), so a new DrawingController
+  // can start over with the fresh refs.
+  // Naming kept for readability; only one drawing gesture layer per panel.
   /** Klines last pushed to the rendered series — drives incremental updates. */
   const lastRef = useRef<KlineData[]>(EMPTY_KLINES);
   const klinesRef = useRef<KlineData[]>(EMPTY_KLINES);
@@ -102,6 +110,9 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   const klines = useMarketStore((s) => selectKlines(s, symbol, tf));
   const inds = useChartStore((s) => s.indicators);
   const st = useChartStore((s) => s.settings);
+  const drawingsBySymbol = useChartStore((s) => s.drawingsBySymbol);
+  const selectedId = useChartStore((s) => s.selectedId);
+  const activeTool = useChartStore((s) => s.activeTool);
   const setCD = useChartStore((s) => s.setCrosshairData);
   const theme = useThemeStore((s) => s.theme);
   const status = useMarketStore((s) => s.klineStatus[klineKey(symbol, tf)]);
@@ -110,25 +121,46 @@ export function ChartPanel({ symbol }: { symbol: string }) {
    *  per tick: it walks the whole array, and ticks arrive several times a second. */
   const [holes, setHoles] = useState<{ bars: number; lagMs: number }>({ bars: 0, lagMs: 0 });
 
-  /** The primitive reads the world through this — no snapshots, so a store change
-   *  is visible on the next paint without an extra subscription. */
-  const drawingsSource = useMemo<DrawingsSource>(() => ({
-    drawings: () => {
-      const s = useChartStore.getState();
-      return s.settings.showDrawings ? (s.drawingsBySymbol[symbol] ?? []) : [];
-    },
-    selectedId: () => useChartStore.getState().selectedId,
-    hoverId: () => primRef.current ? hoverIdRef.current : null,
-    ghost: () => ghostRef.current,
-    pending: () => pendingRef.current,
-    interactive: () => useChartStore.getState().activeTool === "crosshair",
-    palette: () => chartPalette(theme),
-    fmtPrice: (p) => fmtPrice(p, symbol),
-    fmtTime: (t) => fmtTime(t * 1000),
-  }), [symbol, theme]);
+  // ── Refs for the pointer-layer (must be created before `DrawingController`,
+  //     which is a component and reads them via its props) ──────────
   const hoverIdRef = useRef<string | null>(null);
   const ghostRef = useRef<import("@/lib/types").Drawing | null>(null);
   const pendingRef = useRef<import("@/lib/types").DrawingPoint[]>([]);
+
+  /** `DrawingController` is mounted once per lifetime of this chart panel.
+   *  Its props are fresh every render, so `epoch` is bumped by the chart
+   *  lifecycle effect below whenever the chart is recreated — or whenever a
+   *  new symbol/timeframe forces a completely new chart instance. */
+  const drawingController = DrawingController({
+    chartRef: chRef,
+    primitiveRef: primRef,
+    hostRef: chartHostRef,
+    symbol,
+    epoch: chartEpoch,
+    hoverIdRef,
+    ghostRef,
+    pendingRef,
+    seriesRef: mainRef,
+  });
+
+  /** What the primitive may look at. Everything is a getter so the primitive
+   *  never holds a stale snapshot of the store. `drawingsBySymbol` /
+   *  `selectedId` / `activeTool` are kept separately (they live on the whole
+   *  chart state — ChartState, not ChartSettings) because the primitive reads
+   *  them through getters that `DrawingsPrimitive` re-evaluates on every paint.
+   */
+  const drawingsSource = useMemo<DrawingsSource>(() => ({
+    drawings: () => drawingsBySymbol[symbol] ?? [],
+    selectedId: () => selectedId,
+    hoverId: () => hoverIdRef.current,
+    ghost: () => ghostRef.current,
+    pending: () => pendingRef.current,
+    interactive: () => activeTool === "crosshair",
+    palette: () => chartPalette(theme),
+    fmtPrice: (p) => fmtPrice(p, symbol),
+    fmtTime: (t) => fmtDateTime(t * 1000),
+    barSeconds: () => TIMEFRAME_SPAN_MS[tf] / 1000,
+  }), [drawingsBySymbol, selectedId, activeTool, symbol, theme, tf]);
 
   // ── Chart lifecycle (created once; theme is applied as options) ──────
   useEffect(() => {
@@ -159,6 +191,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     const vs = ch.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceScaleId: "volume" });
     ch.priceScale("volume").applyOptions({ scaleMargins: { top: 1 - VOLUME_BAND, bottom: 0 } });
 
+    // `drawingsSource` is a store getter — available before this effect runs.
     const primitive = new DrawingsPrimitive(() => ch, drawingsSource);
     cs.attachPrimitive(primitive);
 
@@ -302,7 +335,7 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     }
 
     const timeScale = ch.timeScale();
-    const logicalRange = plan.kind === "full" ? timeScale.getVisibleLogicalRange() : null;
+    const logicalRange = timeScale.getVisibleLogicalRange();
     const timeRange = timeScale.getVisibleRange();
 
     const applyFull = () => {
@@ -382,8 +415,17 @@ export function ChartPanel({ symbol }: { symbol: string }) {
 
     applyFull();
     const bars = klines;
+    const prevLastIndex = prev.length > 0 ? slotCount(prev) - 1 : null;
+    const followingEdge = !switchedSymbol && logicalRange != null && prevLastIndex != null && logicalRange.to >= prevLastIndex - 1;
+    const tailAdvanced = prev.length > 0 && bars[bars.length - 1]!.openTime > prev[prev.length - 1]!.openTime;
+    const barsAdded = bars.length > prev.length;
     if (!refitForTimeframe()) {
-      if (plan.kind === "full" && plan.shift > 0 && logicalRange) {
+      if (followingEdge && (tailAdvanced || barsAdded)) {
+        // A live-edge viewer must not stay parked on the old side of a gap that
+        // just healed (or that a new candle just jumped across).
+        try { timeScale.setVisibleLogicalRange(switchVisibleRange(bars)); }
+        catch { timeScale.scrollToRealTime(); }
+      } else if (plan.kind === "full" && plan.shift > 0 && logicalRange) {
         const shift = slotCount(klines) - slotCount(prev);
         timeScale.setVisibleLogicalRange({ from: logicalRange.from + shift, to: logicalRange.to + shift });
       } else if (timeRange && bars.length > 0) {
@@ -414,6 +456,17 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     const id = setTimeout(() => setHoles(missingHistory(klines, tf)), 400);
     return () => clearTimeout(id);
   }, [klines, tf]);
+
+  // The gateway can heal an interior gap after the page that painted this window
+  // was served. A current live tail alone is not a reason to re-pull, so ask
+  // again while the badge still reports absent bars and the crawl is not settled.
+  useEffect(() => {
+    if (holes.bars === 0 || status?.state !== "ready") return;
+    const historyStatus = status.historyStatus;
+    if (historyStatus === "complete" || historyStatus === "exhausted") return;
+    const id = setInterval(() => { void refreshRecentKlines(symbol, tf); }, GAP_HEAL_POLL_MS);
+    return () => clearInterval(id);
+  }, [holes.bars, status?.state, status?.historyStatus, symbol, tf]);
 
   // ── Indicators: stable series registry, refreshed at most 1×/s ───────
   useEffect(() => {
@@ -572,8 +625,12 @@ export function ChartPanel({ symbol }: { symbol: string }) {
       const ch = chRef.current;
       if (!ch) return;
       try {
-        ch.timeScale().resetTimeScale();
-        ch.timeScale().scrollToRealTime();
+        const bars = lastRef.current;
+        if (bars.length > 0) ch.timeScale().setVisibleLogicalRange(switchVisibleRange(bars));
+        else {
+          ch.timeScale().resetTimeScale();
+          ch.timeScale().scrollToRealTime();
+        }
       } catch { /* time scale not ready */ }
       try { mainRef.current?.priceScale().applyOptions({ autoScale: true }); } catch { /* noop */ }
     };
@@ -581,11 +638,18 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     return () => window.removeEventListener(RESET_VIEW_EVENT, onReset);
   }, []);
 
+  // `DrawingController` is called here, at the top level of the component, so
+  // its own hooks are safe. It is intentionally mounted once per lifetime of
+  // this panel: the same controller instance is reused across normal chart
+  // model changes (candles, timeframe, indicators) because the gesture layer
+  // Anchor the pointer-layer refs (created above) on the component that actually
+  // owns the gestures: DrawingController is a hook component whose props point at
+  // these refs, so rendering it here lets the pointer layer resolve the correct
+  // chart, primitive and series even while the chart instance is being rebuilt
+  // (epoch bump) or the symbol changes.
   return (
     <div className="relative h-full w-full">
       <div ref={chartHostRef} className="h-full w-full" />
-      <CrossInfo />
-      <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} staleView={staleView} missing={holes.bars} lagMs={holes.lagMs} connected={connected} onRetry={retry} />
       <DrawingController
         chartRef={chRef}
         primitiveRef={primRef}
@@ -595,7 +659,10 @@ export function ChartPanel({ symbol }: { symbol: string }) {
         hoverIdRef={hoverIdRef}
         ghostRef={ghostRef}
         pendingRef={pendingRef}
+        seriesRef={mainRef}
       />
+      <CrossInfo />
+      <ChartStateOverlay symbol={symbol} timeframe={tf} status={status} count={klines.length} staleView={staleView} missing={holes.bars} lagMs={holes.lagMs} connected={connected} onRetry={retry} />
       <DrawingsPanel symbol={symbol} />
     </div>
   );
@@ -623,7 +690,7 @@ function CrossInfo() {
           </span>
         )}
         {d.volume > 0 && (<span style={{ color: "var(--text-muted)" }}>V<span style={{ color: "var(--text-secondary)" }}> {fmtVolume(d.volume)}</span></span>)}
-        <span style={{ color: "var(--text-muted)" }}>{fmtTime(d.time)}</span>
+        <span style={{ color: "var(--text-muted)" }}>{fmtDateTime(d.time)}</span>
       </>)}
     </div>
   );

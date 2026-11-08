@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState, type RefObject } from "react";
-import type { IChartApi, MouseEventParams } from "lightweight-charts";
+import type { IChartApi, ISeriesApi, MouseEventParams, SeriesType } from "lightweight-charts";
 import { useChartStore, selectDrawings } from "@/lib/store/chartStore";
 import { COLOR_LABEL, PALETTE, TYPE_LABEL, drawingForTool, isPlacementTool, pointsRequired } from "@/lib/utils/drawings";
 import { parseHit, resolveColor, type DrawingsPrimitive, type ShapeColor } from "@/lib/chart/drawingsPrimitive";
@@ -23,6 +23,11 @@ interface Props {
   hoverIdRef: RefObject<string | null>;
   ghostRef: RefObject<Drawing | null>;
   pendingRef: RefObject<DrawingPoint[]>;
+  /** The price series attached to the right price scale (candle series). The
+   *  fallback in `onCrosshairMove` uses it to place a tool when the pointer is
+   *  outside the visible candle range: `coordinateToTime` can return null there
+   *  while `coordinateToPrice` is still invertible. */
+  seriesRef: RefObject<ISeriesApi<SeriesType> | null>;
 }
 
 type Hit = { id: string; part: "body" | "point"; index: number };
@@ -56,7 +61,7 @@ const MENU_H = 168;
  *
  * Nothing here touches orders — these are chart annotations only.
  */
-export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epoch, hoverIdRef, ghostRef, pendingRef }: Props) {
+export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epoch, hoverIdRef, ghostRef, pendingRef, seriesRef }: Props) {
   /** `symbol` is remembered so a menu opened on one chart can never repaint on another. */
   const [menu, setMenu] = useState<{ id: string; x: number; y: number; symbol: string } | null>(null);
   const activeTool = useChartStore((s) => s.activeTool);
@@ -196,19 +201,26 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
       if (inPane && p.point) {
         pt = prim.unproject(p.point.x, p.point.y);
       }
+      // When the pointer is outside the candle range the axis lookups can return
+      // null (scale not ready yet, or the logical is outside the visible range
+      // and the round trip cannot be inverted). Fall back to the scale's own
+      // coordinate conversion so a tool dragged before the first or after the
+      // last candle still lands where the pointer is.
       if (!pt && p.point && inPane) {
-        // Allow drawing outside candle range - try to compute anyway
         const chart = chartRef.current;
         if (chart) {
           try {
-            const ts = chart.timeScale();
-            const time = ts.coordinateToTime(p.point.x);
-            const series = (chart as any)._private__serieses?.[0] || (chart as any).serieses?.()?.[0];
-            if (typeof time === 'number' && series) {
-              const price = series.coordinateToPrice ? series.coordinateToPrice(p.point.y) : null;
-              if (price != null) pt = { time, price: Number(price) };
+            const timeScale = chart.timeScale();
+            const time = timeScale.coordinateToTime(p.point.x);
+            const series = seriesRef.current;
+            if (typeof time === "number" && Number.isFinite(time)) {
+              const price = series ? series.coordinateToPrice(p.point.y) : null;
+              if (price != null && Number.isFinite(Number(price))) pt = { time: Math.round(time), price: Number(price) };
             }
-          } catch {}
+          } catch {
+            // Chart may not be fully mounted during a resize/transition; the
+            // primitive's own extrapolation is the authoritative path.
+          }
         }
       }
       aim = pt && p.point ? { x: p.point.x, y: p.point.y, pt } : null;

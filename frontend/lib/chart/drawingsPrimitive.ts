@@ -16,12 +16,15 @@
  * comes from the live `ChartPalette`. Nothing here hard-codes a hex.
  */
 import type {
+  BarPrice,
+  Coordinate,
   IChartApi,
   IPrimitivePaneRenderer,
   IPrimitivePaneView,
   ISeriesApi,
   ISeriesPrimitive,
   ISeriesPrimitiveAxisView,
+  Logical,
   PrimitiveHoveredItem,
   SeriesAttachedParameter,
   SeriesType,
@@ -48,6 +51,8 @@ export interface DrawingsSource {
   palette(): ChartPalette;
   fmtPrice(price: number): string;
   fmtTime(time: number): string;
+  /** Duration of one axis slot in seconds; lets anchors live outside the loaded candles. */
+  barSeconds(): number;
 }
 
 /**
@@ -141,6 +146,99 @@ export interface Projector {
   yOf(price: number): number | null;
   plotW: number;
   plotH: number;
+}
+
+type TimeScaleApi = ReturnType<IChartApi["timeScale"]>;
+
+function numericTime(t: Time): number | null {
+  return typeof t === "number" && Number.isFinite(t) ? t : null;
+}
+
+/** Axis position of a time, including the empty padding before/after the data.
+ *  Inside a capped outage the neighbouring axis points are adjacent although
+ *  their timestamps are not, so the fraction is taken across the drawn slot. */
+/** Axis position of a time, including the empty padding before/after the data. */
+function logicalIndexOfTime(data: readonly { time: Time }[], time: number, barSeconds: number): number | null {
+  const n = data.length;
+  if (n === 0 || !(barSeconds > 0) || !Number.isFinite(time)) return null;
+  const first = numericTime(data[0]!.time);
+  const last = numericTime(data[n - 1]!.time);
+  if (first == null || last == null) return null;
+  if (time <= first) return (time - first) / barSeconds;
+  if (time >= last) return (n - 1) + (time - last) / barSeconds;
+
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const t = numericTime(data[mid]!.time);
+    if (t == null) return null;
+    if (t < time) lo = mid + 1;
+    else hi = mid;
+  }
+  const next = numericTime(data[lo]!.time);
+  if (next == null) return null;
+  if (next === time) return lo;
+  const prev = numericTime(data[lo - 1]!.time);
+  if (prev == null || next <= prev) return null;
+  return (lo - 1) + (time - prev) / (next - prev);
+}
+
+function timeAtLogical(data: readonly { time: Time }[], logical: number, barSeconds: number): number | null {
+  const n = data.length;
+  if (n === 0 || !(barSeconds > 0) || !Number.isFinite(logical)) return null;
+  const first = numericTime(data[0]!.time);
+  const last = numericTime(data[n - 1]!.time);
+  if (first == null || last == null) return null;
+  if (logical <= 0) return first + logical * barSeconds;
+  if (logical >= n - 1) return last + (logical - (n - 1)) * barSeconds;
+  const i = Math.floor(logical);
+  const a = numericTime(data[i]!.time);
+  const b = numericTime(data[i + 1]!.time);
+  if (a == null || b == null) return null;
+  return a + (b - a) * (logical - i);
+}
+
+/** `logicalToCoordinate` is only valid for integer indices; the fractional part
+ *  is carried by the bar spacing instead of being passed into the library.
+ *  An index outside the visible axis (before the first candle or after the
+ *  last one) has no library coordinate, so we extrapolate from the nearest
+ *  visible edge — this is what lets drawings live outside the loaded candle
+ *  range instead of vanishing. */
+function coordinateOfLogical(ts: TimeScaleApi, logical: number, spacing: number): number | null {
+  if (!(spacing > 0) || !Number.isFinite(logical)) return null;
+  const anchor = Math.round(logical);
+  let x: Coordinate | null = ts.logicalToCoordinate(anchor as Logical);
+  if (x == null || !Number.isFinite(Number(x))) {
+    const range = ts.getVisibleLogicalRange();
+    if (!range) return null;
+    const edge = logical < range.from ? range.from : range.to;
+    const edgeX: Coordinate | null = ts.logicalToCoordinate(edge as Logical);
+    if (edgeX == null || !Number.isFinite(Number(edgeX))) return null;
+    x = (edgeX + (logical - edge) * spacing) as Coordinate;
+  } else {
+    x = (x + (logical - anchor) * spacing) as Coordinate;
+  }
+  return x;
+}
+
+function logicalOfCoordinate(ts: TimeScaleApi, x: number, spacing: number): number | null {
+  if (!(spacing > 0) || !Number.isFinite(x)) return null;
+  const anchor = ts.coordinateToLogical(x);
+  if (anchor != null) {
+    const ax = ts.logicalToCoordinate(anchor);
+    if (ax != null && Number.isFinite(Number(ax))) return Number(anchor) + (x - Number(ax)) / spacing;
+  }
+  // Outside the axis: extrapolate from the nearest visible edge so a tool
+  // dragged before the first candle or after the last one keeps working.
+  const range = ts.getVisibleLogicalRange();
+  if (!range) return null;
+  const fromX = ts.logicalToCoordinate(range.from as Logical);
+  const toX = ts.logicalToCoordinate(range.to as Logical);
+  if (fromX == null || toX == null || !Number.isFinite(Number(fromX)) || !Number.isFinite(Number(toX))) return null;
+  const fx = Number(fromX);
+  const tx = Number(toX);
+  return x <= fx ? Number(range.from) + (x - fx) / spacing : Number(range.to) + (x - tx) / spacing;
 }
 
 export interface ShapeStyle {
@@ -935,12 +1033,38 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
     const series = this.series;
     if (!chart || !series) return null;
     const ts = chart.timeScale();
+    const data = series.data();
+    const spacing = ts.options().barSpacing;
+    const barSeconds = this.source.barSeconds();
     return {
-      xOf: (t) => { const v = ts.timeToCoordinate(t as Time); return v == null ? null : v; },
-      yOf: (p) => { const v = series.priceToCoordinate(p); return v == null ? null : v; },
+      xOf: (t) => {
+        const logical = logicalIndexOfTime(data, t, barSeconds);
+        return logical == null ? null : coordinateOfLogical(ts, logical, spacing);
+      },
+      yOf: (p) => {
+        const v = series.priceToCoordinate(p);
+        if (v != null && Number.isFinite(Number(v))) return Number(v);
+        return this.priceAsCoordinate(chart, p);
+      },
       plotW: ts.width(),
       plotH: this.paneHeight(chart),
     };
+  }
+
+  /** `series.priceToCoordinate` returns null above/below the visible band. This
+   *  stretches the pixel from the nearest edge of the current price range, so an
+   *  anchor dragged past the top or bottom of the chart keeps moving instead of
+   *  snapping back to the nearest candle. */
+  private priceAsCoordinate(chart: IChartApi, p: number): number | null {
+    const series = this.series;
+    if (!series) return null;
+    const ps = chart.priceScale("right");
+    const visible = ps.getVisibleRange();
+    if (!visible) return null;
+    const minY = series.priceToCoordinate(visible.from);
+    const maxY = series.priceToCoordinate(visible.to);
+    if (minY == null || maxY == null || minY === maxY) return null;
+    return minY + (p - visible.from) * (maxY - minY) / (visible.to - visible.from);
   }
 
   /** ISeriesApi does not expose its pane, so the owning pane is found once and
@@ -973,27 +1097,26 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
     const series = this.series;
     if (!chart || !series) return null;
     const ts = chart.timeScale();
-    let time = ts.coordinateToTime(x);
-    if (typeof time !== "number") {
-      // Extrapolate beyond candle range using visible range
-      const range = ts.getVisibleRange();
-      const lr = ts.getVisibleLogicalRange();
-      if (range && lr && typeof lr.from === "number" && typeof lr.to === "number") {
-        const t1 = typeof range.from === "number" ? range.from : Number(range.from);
-        const t2 = typeof range.to === "number" ? range.to : Number(range.to);
-        const span = t2 - t1;
-        const lspan = lr.to - lr.from;
-        if (lspan > 0 && span > 0) {
-          const logicalPos = lr.from + (x / ts.width()) * lspan;
-          time = Math.round(t1 + ((logicalPos - lr.from) / lspan) * span) as Time;
-        }
-      }
+    const spacing = ts.options().barSpacing;
+    const barSeconds = this.source.barSeconds();
+    const logical = logicalOfCoordinate(ts, x, spacing);
+    if (logical == null) return null;
+    const time = timeAtLogical(series.data(), logical, barSeconds);
+    if (time == null || !Number.isFinite(time)) return null;
+    let price = series.coordinateToPrice(y);
+    if (price == null || !Number.isFinite(Number(price))) {
+      // The cursor is above/below the visible price band: stretch the price
+      // back from the nearest edge of the current range so a drag keeps going
+      // past the top/bottom of the chart instead of snapping.
+      const visible = chart.priceScale("right").getVisibleRange();
+      if (!visible) return null;
+      const minPrice = series.priceToCoordinate(visible.from);
+      const maxPrice = series.priceToCoordinate(visible.to);
+      if (minPrice == null || maxPrice == null || minPrice === maxPrice) return null;
+      const frac = (y - minPrice) / (maxPrice - minPrice);
+      price = (minPrice + frac * (maxPrice - minPrice)) as BarPrice;
     }
-    if (typeof time !== "number" || !Number.isFinite(time)) return null;
-    const zero = series.priceToCoordinate(0);
-    const price = series.coordinateToPrice(zero != null && y > zero - 2 ? zero - 2 : y);
-    if (price == null) return null;
-    return { time, price: Number(price) };
+    return { time: Math.round(time), price: Number(price) };
   }
 
   /** Shapes for the current frame, including the selection handles. */
