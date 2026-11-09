@@ -127,22 +127,6 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   const ghostRef = useRef<import("@/lib/types").Drawing | null>(null);
   const pendingRef = useRef<import("@/lib/types").DrawingPoint[]>([]);
 
-  /** `DrawingController` is mounted once per lifetime of this chart panel.
-   *  Its props are fresh every render, so `epoch` is bumped by the chart
-   *  lifecycle effect below whenever the chart is recreated — or whenever a
-   *  new symbol/timeframe forces a completely new chart instance. */
-  const drawingController = DrawingController({
-    chartRef: chRef,
-    primitiveRef: primRef,
-    hostRef: chartHostRef,
-    symbol,
-    epoch: chartEpoch,
-    hoverIdRef,
-    ghostRef,
-    pendingRef,
-    seriesRef: mainRef,
-  });
-
   /** What the primitive may look at. Everything is a getter so the primitive
    *  never holds a stale snapshot of the store. `drawingsBySymbol` /
    *  `selectedId` / `activeTool` are kept separately (they live on the whole
@@ -241,6 +225,11 @@ export function ChartPanel({ symbol }: { symbol: string }) {
     // The primitive is rebuilt with the chart, so its source identity is fixed here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setCD]);
+
+  // Keep the primitive connected to the latest drawing source.
+  useEffect(() => {
+    primRef.current?.setSource(drawingsSource);
+  }, [drawingsSource]);
 
   // ── Theme: recolour in place so zoom/scroll never resets ─────────────
   useEffect(() => {
@@ -461,12 +450,10 @@ export function ChartPanel({ symbol }: { symbol: string }) {
   // was served. A current live tail alone is not a reason to re-pull, so ask
   // again while the badge still reports absent bars and the crawl is not settled.
   useEffect(() => {
-    if (holes.bars === 0 || status?.state !== "ready") return;
-    const historyStatus = status.historyStatus;
-    if (historyStatus === "complete" || historyStatus === "exhausted") return;
+    if (holes.bars === 0) return;
     const id = setInterval(() => { void refreshRecentKlines(symbol, tf); }, GAP_HEAL_POLL_MS);
     return () => clearInterval(id);
-  }, [holes.bars, status?.state, status?.historyStatus, symbol, tf]);
+  }, [holes.bars, symbol, tf, status?.historyStatus, status?.state]);
 
   // ── Indicators: stable series registry, refreshed at most 1×/s ───────
   useEffect(() => {

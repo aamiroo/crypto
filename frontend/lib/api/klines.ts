@@ -217,12 +217,15 @@ export async function refreshRecentKlines(symbol: string, interval: Timeframe | 
   const live = hasRecentTail(existing);
   const missing = missingHistory(existing, interval as Timeframe).bars;
   if (live && missing === 0) return true;
-  if (state.klineStatus[key]?.state !== "ready") return false;
-  // The gateway has already asked the venue and been told there is nothing
-  // there; re-pulling the same page cannot turn an absent bar into a present one.
-  const historyStatus = state.klineStatus[key]?.historyStatus;
-  if (live && missing > 0 && (historyStatus === "complete" || historyStatus === "exhausted")) return true;
 
+  // Rate limiting / ladder ownership: if the gateway reports an error or the
+  // window is not in a state that allows recovery, do not re-fetch immediately.
+  const klineStatus = state.klineStatus[key];
+  if (klineStatus?.state === "error") return false;
+
+  // Always attempt recovery when there are missing candles, regardless of
+  // historyStatus. The gateway may be crawling, at the end of history, or
+  // between states — we should still try to fill the gap.
   const last = lastRefreshAt.get(key) ?? 0;
   if (Date.now() - last < REFRESH_MIN_MS) return false;
   lastRefreshAt.set(key, Date.now());

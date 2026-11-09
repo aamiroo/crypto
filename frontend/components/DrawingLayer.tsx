@@ -91,16 +91,23 @@ export function DrawingController({ chartRef, primitiveRef, hostRef, symbol, epo
     const unsubscribe = useChartStore.subscribe((s, prev) => {
       // The menu belongs to the cursor tool; arming anything else retires it.
       if (s.activeTool !== prev.activeTool) setMenu(null);
-      if (
-        s.drawingsBySymbol === prev.drawingsBySymbol &&
-        s.selectedId === prev.selectedId &&
-        s.settings === prev.settings &&
-        s.activeTool === prev.activeTool
-      ) return;
+      // Check if drawings for the current symbol have changed
+      const currentDrawings = s.drawingsBySymbol[symbol] ?? [];
+      const prevDrawings = prev.drawingsBySymbol[symbol] ?? [];
+      const drawingsChanged =
+        currentDrawings.length !== prevDrawings.length ||
+        // Check if any drawing's id or type changed at the same index
+        currentDrawings.some((d, i) => {
+          const prevD = prevDrawings[i];
+          return d.id !== prevD?.id || d.type !== prevD?.type;
+        });
+      // Always invalidate the primitive when drawings change to ensure
+      // the drawing layer re-renders. Removed the early return that was
+      // preventing invalidation when selectedId and settings hadn't changed.
       primitiveRef.current?.invalidate();
     });
     return unsubscribe;
-  }, [primitiveRef]);
+  }, [primitiveRef, symbol]);
 
   useEffect(() => {
     const chart = chartRef.current;

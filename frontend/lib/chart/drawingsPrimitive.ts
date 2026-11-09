@@ -988,7 +988,7 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
 
   constructor(
     private readonly getChart: () => IChartApi | null,
-    readonly source: DrawingsSource,
+    public source: DrawingsSource,
   ) {
     const self = this;
     this.views = [{ renderer: () => new DrawingsRenderer(self) }];
@@ -998,6 +998,14 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
     this.chart = params.chart as unknown as IChartApi;
     this.series = params.series;
     this.requestUpdate = params.requestUpdate;
+  }
+
+  setSource(source: DrawingsSource): void {
+    this.source = source;
+    this.cached = null;
+    this.axisKey = "";
+    this.timeKey = "";
+    this.requestUpdate?.();
   }
 
   detached(): void {
