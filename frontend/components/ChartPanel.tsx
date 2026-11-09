@@ -40,7 +40,7 @@ const VOLUME_BAND = 0.18;
 /** Start fetching older history once the left edge gets within this many bars. */
 const LOAD_MORE_THRESHOLD = 5;
 /** Re-pull a gapped window while the gateway may still be healing it. */
-const GAP_HEAL_POLL_MS = 30_000;
+const GAP_HEAL_POLL_MS = 5_000;
 
 type AltKind = "line" | "area";
 type AltSeries = ISeriesApi<"Line" | "Area">;

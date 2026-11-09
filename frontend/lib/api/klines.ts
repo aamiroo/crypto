@@ -1,6 +1,6 @@
 import { useMarketStore, klineTickCursor } from "@/lib/store/marketStore";
 import {
-  EMPTY_KLINES, MAX_KLINES, isCurrentBar, klineKey, missingHistory, normalizeKlines,
+  EMPTY_KLINES, MAX_KLINES, TIMEFRAME_SPAN_MS, isCurrentBar, klineKey, missingHistory, normalizeKlines,
 } from "@/lib/utils/klines";
 import type { KlineData, Timeframe } from "@/lib/types";
 
@@ -37,6 +37,7 @@ const REQUEST_TIMEOUT_MS = 15000;
 
 const inFlightHistorical = new Set<string>();
 const inFlightBackfill = new Set<string>();
+const inFlightGapRepair = new Set<string>();
 const backfillRetryAt = new Map<string, number>();
 const backfillExhausted = new Set<string>();
 /** Windows already widened once to HISTORY_TARGET this session. */
@@ -192,7 +193,7 @@ function primeOlder(
 
 /** Floor between tail refreshes. `loadHistoricalKlines` re-arms its retry
  *  ladder on every call, so an unguarded refresh would defeat the decay. */
-const REFRESH_MIN_MS = 30_000;
+const REFRESH_MIN_MS = 5_000;
 
 const lastRefreshAt = new Map<string, number>();
 
@@ -218,19 +219,56 @@ export async function refreshRecentKlines(symbol: string, interval: Timeframe | 
   const missing = missingHistory(existing, interval as Timeframe).bars;
   if (live && missing === 0) return true;
 
-  // Rate limiting / ladder ownership: if the gateway reports an error or the
-  // window is not in a state that allows recovery, do not re-fetch immediately.
   const klineStatus = state.klineStatus[key];
   if (klineStatus?.state === "error") return false;
 
-  // Always attempt recovery when there are missing candles, regardless of
-  // historyStatus. The gateway may be crawling, at the end of history, or
-  // between states — we should still try to fill the gap.
   const last = lastRefreshAt.get(key) ?? 0;
   if (Date.now() - last < REFRESH_MIN_MS) return false;
   lastRefreshAt.set(key, Date.now());
 
-  await loadHistoricalKlines(symbol, interval);
+  // Repair the newest internal gap directly instead of repeatedly fetching
+  // the latest page, which cannot fill a gap deeper in the series.
+  const span = TIMEFRAME_SPAN_MS[interval as Timeframe] ?? 60_000;
+  let gap: { endTime: number; bars: number } | undefined;
+
+  for (let i = existing.length - 1; i > 0; i--) {
+    const prev = existing[i - 1]!;
+    const next = existing[i]!;
+    const bars = Math.floor((next.openTime - prev.openTime) / span) - 1;
+    if (bars > 0) {
+      gap = { endTime: next.openTime - 1, bars };
+      break;
+    }
+  }
+
+  if (gap && !inFlightGapRepair.has(key)) {
+    inFlightGapRepair.add(key);
+    try {
+      const cursor = klineTickCursor();
+      const page = await fetchKlineBatch(
+        symbol,
+        interval,
+        Math.min(BACKFILL_LIMIT, gap.bars),
+        gap.endTime,
+      );
+      useMarketStore.getState().mergeKlinesInto(symbol, interval, page.candles, cursor);
+    } catch (err) {
+      console.warn("[GapRepair] Failed:", {
+        symbol,
+        interval,
+        gap,
+        error: err,
+      });
+    } finally {
+      inFlightGapRepair.delete(key);
+    }
+  }
+
+  const afterGap = useMarketStore.getState().klines[symbol]?.[interval] ?? EMPTY_KLINES;
+  if (!hasRecentTail(afterGap)) {
+    await loadHistoricalKlines(symbol, interval);
+  }
+
   const after = useMarketStore.getState().klines[symbol]?.[interval] ?? EMPTY_KLINES;
   return hasRecentTail(after);
 }

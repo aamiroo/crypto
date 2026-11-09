@@ -503,9 +503,13 @@ function createKlinesFetcher({ store, logger }) {
     trimCache();
     // Only the window ending "now" is a usable fallback for "recent"; an
     // older page deepens the mirror's history instead of replacing it.
-    if (endTime) store?.rememberOlder(symbol, interval, data);
-    else store?.remember(symbol, interval, data);
-    return { data, source: "venue" };
+    let added = 0;
+    if (endTime) {
+      added = store?.rememberOlder(symbol, interval, data) ?? 0;
+    } else {
+      store?.remember(symbol, interval, data);
+    }
+    return { data, source: "venue", added };
   }
 
   /** The probe never landed. What we hold is still an answer: the recent window

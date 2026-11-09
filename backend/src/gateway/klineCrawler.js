@@ -218,7 +218,9 @@ export function createKlineCrawler({
       stats.exhausted += 1;
       return true;
     }
-    const added = store.rememberOlder(symbol, interval, rows);
+    const added = Number.isFinite(page1.added)
+      ? page1.added
+      : store.rememberOlder(symbol, interval, rows);
     stats.merged += rows.length;
 
     if (gap) {
