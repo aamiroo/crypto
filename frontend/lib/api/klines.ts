@@ -219,8 +219,11 @@ export async function refreshRecentKlines(symbol: string, interval: Timeframe | 
   const missing = missingHistory(existing, interval as Timeframe).bars;
   if (live && missing === 0) return true;
 
+  // A failing load owns its own retry ladder — but only while that ladder is
+  // still armed. Once it has run out (`historyRetry` empty) the window sat in
+  // "error" until a reload, because nothing else was allowed to retry it.
   const klineStatus = state.klineStatus[key];
-  if (klineStatus?.state === "error") return false;
+  if (klineStatus?.state === "error" && historyRetry.has(key)) return false;
 
   const last = lastRefreshAt.get(key) ?? 0;
   if (Date.now() - last < REFRESH_MIN_MS) return false;
@@ -252,6 +255,14 @@ export async function refreshRecentKlines(symbol: string, interval: Timeframe | 
         gap.endTime,
       );
       useMarketStore.getState().mergeKlinesInto(symbol, interval, page.candles, cursor);
+      // The page carries the gateway's current crawl state. Without this the
+      // badge kept the `historyStatus` from the first load ("waiting" → "the
+      // exchange is not answering") long after the gateway had healed the hole,
+      // and only a reload, which re-runs the load, refreshed it.
+      const cur = useMarketStore.getState().klineStatus[key];
+      if (page.history && cur?.state !== "loading") {
+        useMarketStore.getState().setKlineStatus(symbol, interval, "ready", undefined, page.history.status);
+      }
     } catch (err) {
       console.warn("[GapRepair] Failed:", {
         symbol,

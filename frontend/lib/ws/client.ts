@@ -158,7 +158,8 @@ export class MarketWSClient {
     };
 
     ws.onmessage = (evt) => {
-      const env = JSON.parse(evt.data) as Envelope;
+      let env: Envelope;
+      try { env = JSON.parse(evt.data) as Envelope; } catch { return; } // one bad frame must not abort the handler
       this.handleEnvelope(env);
     };
 

@@ -885,7 +885,12 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
   });
 
   const clientSym = new Map();                 // client -> selected symbol
-  const clientKline = new Map();               // client -> Map<symbol, appInterval>
+  // client -> Map<"SYMBOL|interval", [symbol, interval]>. Keyed by the pair, not
+  // the symbol: a client may watch one symbol on several intervals at once (two
+  // panels, or a timeframe switch whose unsubscribe lands after the new subscribe),
+  // and an unsubscribe for one interval must never drop another.
+  const clientKline = new Map();
+  const klineKey = (sym, iv) => `${sym}|${iv}`;
 
   /** Push the current demand into the collector: orderbook/trades follow the
    *  symbol each client selected, klines the exact (symbol, interval) pairs.
@@ -894,7 +899,7 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
     const syms = new Set(clientSym.values());
     const pairs = [];
     for (const m of clientKline.values()) {
-      for (const [sym, iv] of m) pairs.push([sym, iv]);
+      for (const [sym, iv] of m.values()) pairs.push([sym, iv]);
     }
     collector?.sync([...syms], pairs);
     // Start filling a newly watched window now instead of on the next refresh
@@ -916,7 +921,7 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
   const klineDemand = () => {
     const out = new Map();
     for (const m of clientKline.values()) {
-      for (const [sym, iv] of m) out.set(`${sym}|${iv}`, [sym, iv]);
+      for (const [sym, iv] of m.values()) out.set(klineKey(sym, iv), [sym, iv]);
     }
     return [...out.values()];
   };
@@ -997,7 +1002,7 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
           if (iv) {
             let m = clientKline.get(client);
             if (!m) { m = new Map(); clientKline.set(client, m); }
-            m.set(sym, iv);
+            m.set(klineKey(sym, iv), [sym, iv]);
           }
         }
         syncDetail();
@@ -1010,7 +1015,7 @@ export function createGateway(instruments, venues, logger, collector, klines, cr
           if (ch.channel === "kline") {
             iv = parseInterval(ch.interval);
             if (!iv) { sendError(client, "BAD_INTERVAL", `unknown interval: ${String(ch.interval ?? "").slice(0, 16)}`); continue; }
-            clientKline.get(client)?.delete(sym);
+            clientKline.get(client)?.delete(klineKey(sym, iv));
           }
           hub.unsubscribe(client, ch.channel, sym, iv);
         }
